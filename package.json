@@ -1,0 +1,21 @@
+{
+	"name": "studio-sync",
+	"version": "2.1.0",
+	"description": "Two-way sync between Roblox Studio and a Rojo project, built for agents: an always-on daemon plus a Studio plugin",
+	"private": true,
+	"type": "module",
+	"bin": {
+		"studio-sync": "bin/studio-sync.js"
+	},
+	"engines": {
+		"node": ">=23.6"
+	},
+	"scripts": {
+		"check": "tsc --noEmit",
+		"test": "node --test test/"
+	},
+	"devDependencies": {
+		"@types/node": "^24.0.0",
+		"typescript": "^5.9.0"
+	}
+}
