@@ -26,7 +26,7 @@ The code is for Windows, but only macOS tested it. On the first use on Windows, 
 1. `npm link`, `studio-sync install`: the launcher in the Startup folder starts the daemon (`studio-sync status`), the plugin goes to `%LOCALAPPDATA%\Roblox\Plugins`, and the skill junction goes to `~/.claude/skills`.
 2. Live sync in both directions on a dev place (`studio-sync wait`, an edit in Studio reaches the file). Include a file with CRLF line endings.
 3. `snapshot`, `base`, `build`: the tool finds `rojo` and `lune` (`spawnSync` uses `shell: true` on Windows). Test paths with spaces.
-4. `open --copy`: `launch()` in `src/open.ts` runs `start "" /min <file>`. This needs the `.rbxl` file association.
-   - If Studio opens on its start page, start `RobloxStudioBeta.exe -task EditFile -localPlaceFile <file>`.
-   - Find the exe through the `roblox-studio` protocol handler in the registry.
-   - Do the same check for `open` (the `roblox-studio:` URI).
+4. `open --copy`: `launch()` in `src/open.ts` runs `start "" /min "<newest %LOCALAPPDATA%\Roblox\Versions\*\RobloxStudioBeta.exe>" -task EditFile -localPlaceFile <file>`.
+   - Make sure Studio opens the place (not the start page), minimized and without focus.
+   - Make sure `open` (the `roblox-studio:` URI) opens the dev place.
+5. `close`: `studiosWith()` finds the Studio through PowerShell `Get-CimInstance`, then `taskkill /F`. Make sure the file and its `.lock` are deleted, and that `<copy>_AutoRecovery_*.rbxl` files move from `%LOCALAPPDATA%\Roblox\RobloxStudio\AutoSaves` to backups.

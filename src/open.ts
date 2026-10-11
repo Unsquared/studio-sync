@@ -8,7 +8,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { PORT, STATE_DIR } from "./paths.ts";
+import { BACKUP_ROOT, PORT, STATE_DIR } from "./paths.ts";
 import { readRegistry, writeRegistry } from "./daemon.ts";
 import { build } from "./snapshot.ts";
 
@@ -33,11 +33,31 @@ function launch(target: string, isFile: boolean): void {
 		const args = isFile ? ["-g", "-n", "-a", app!, "--args", "-task", "EditFile", "-localPlaceFile", target] : ["-g", target];
 		child = spawn("open", args, { detached: true, stdio: "ignore" });
 	} else if (process.platform === "win32") {
-		child = spawn("cmd", ["/c", "start", '""', "/min", `"${target}"`], { detached: true, stdio: "ignore", windowsVerbatimArguments: true });
+		// `start /min` opens minimized and without focus. A file goes straight to Studio's exe:
+		// through the file association it can land on the start page, as on macOS.
+		const exe = isFile ? windowsStudio() : null;
+		if (isFile && !exe) throw new Error("RobloxStudioBeta.exe not found under %LOCALAPPDATA%\\Roblox\\Versions (open Studio once to install it)");
+		const command = exe ? `"${exe}" -task EditFile -localPlaceFile "${target}"` : `"${target}"`;
+		child = spawn("cmd", ["/c", `start "" /min ${command}`], { detached: true, stdio: "ignore", windowsVerbatimArguments: true });
 	} else {
 		throw new Error("opening Studio is supported on macOS and Windows");
 	}
 	child.unref();
+}
+
+// The newest installed Studio: %LOCALAPPDATA%\Roblox\Versions\version-*\RobloxStudioBeta.exe.
+function windowsStudio(): string | null {
+	const versions = path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "Roblox", "Versions");
+	let best: { exe: string; mtime: number } | null = null;
+	try {
+		for (const version of fs.readdirSync(versions)) {
+			const exe = path.join(versions, version, "RobloxStudioBeta.exe");
+			if (!fs.existsSync(exe)) continue;
+			const mtime = fs.statSync(exe).mtimeMs;
+			if (!best || mtime > best.mtime) best = { exe, mtime };
+		}
+	} catch {}
+	return best?.exe ?? null;
 }
 
 // Waits until a Studio matching `match` is connected to the project at `dir` and has applied its version.
@@ -151,20 +171,19 @@ export async function closeCopies(dir: string, which: string | undefined): Promi
 	for (const id of ids) {
 		const { file } = registry.sessions[id];
 		const pids = studiosWith(file);
+		// No graceful close: Studio ignores SIGTERM on macOS, and a built copy always gets a
+		// "Save changes?" prompt. A copy is disposable; its code is on disk already.
 		for (const pid of pids) {
-			try {
-				process.kill(pid, "SIGTERM");
-			} catch {}
+			if (process.platform === "win32") spawnSync("taskkill", ["/F", "/PID", String(pid)], { stdio: "ignore" });
+			else {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {}
+			}
 		}
-		// Studio can sit on a save prompt; a copy is disposable
-		const deadline = Date.now() + 5000;
-		while (studiosWith(file).length && Date.now() < deadline) await new Promise((r) => setTimeout(r, 250));
-		for (const pid of studiosWith(file)) {
-			try {
-				process.kill(pid, "SIGKILL");
-			} catch {}
-		}
-		await new Promise((r) => setTimeout(r, 500));
+		await new Promise((r) => setTimeout(r, 300));
+		const recovered = await moveRecoveryFiles(file, path.basename(dir));
+		if (recovered) lines.push(recovered);
 		fs.rmSync(file, { force: true });
 		fs.rmSync(file + ".lock", { force: true });
 		delete registry.sessions[id];
@@ -172,4 +191,47 @@ export async function closeCopies(dir: string, which: string | undefined): Promi
 	}
 	writeRegistry(registry);
 	return lines;
+}
+
+// Where Studio writes auto-recovery files; it has moved them between versions.
+function autoSaveDirs(): string[] {
+	const home = os.homedir();
+	if (process.platform === "win32") {
+		return [
+			path.join(process.env.LOCALAPPDATA ?? path.join(home, "AppData", "Local"), "Roblox", "RobloxStudio", "AutoSaves"),
+			path.join(home, "Documents", "ROBLOX", "AutoSaves"),
+		];
+	}
+	return [path.join(home, "Library", "Application Support", "Roblox", "RobloxStudio", "AutoSaves"), path.join(home, "Documents", "ROBLOX", "AutoSaves")];
+}
+
+// Studio deletes `<place>_AutoRecovery_<n>.rbxl` only when it closes by itself. After a kill,
+// the next Studio would offer to recover the copy, so they go to backups (they are normal
+// place files, in case a copy had unsaved work).
+async function moveRecoveryFiles(file: string, projectName: string): Promise<string | null> {
+	const prefix = `${path.basename(file, ".rbxl")}_AutoRecovery_`.toLowerCase();
+	const found = autoSaveDirs().flatMap((d) => {
+		try {
+			return fs.readdirSync(d).filter((f) => f.toLowerCase().startsWith(prefix)).map((f) => path.join(d, f));
+		} catch {
+			return [];
+		}
+	});
+	if (!found.length) return null;
+	const target = path.join(BACKUP_ROOT, projectName, `${new Date().toISOString().replace(/[:.]/g, "-")}-recovery`);
+	fs.mkdirSync(target, { recursive: true });
+	for (const from of found) {
+		// a killed process can hold the file a moment longer on Windows
+		for (let tries = 0; ; tries++) {
+			try {
+				fs.cpSync(from, path.join(target, path.basename(from)));
+				fs.rmSync(from);
+				break;
+			} catch (e) {
+				if (tries >= 20) throw e;
+				await new Promise((r) => setTimeout(r, 250));
+			}
+		}
+	}
+	return `moved ${found.length} auto-recovery file(s) to ${target}`;
 }
