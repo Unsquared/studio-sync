@@ -25,7 +25,7 @@ local HttpService = game:GetService("HttpService")
 local ScriptEditorService = game:GetService("ScriptEditorService")
 local SerializationService = game:GetService("SerializationService")
 
-local PLUGIN_VERSION = "2.1.0"
+local PLUGIN_VERSION = "2.1.1"
 local DEFAULT_URL = "http://localhost:34999"
 local RETRY_OFFLINE = 3
 local RETRY_UNKNOWN = 6
@@ -200,7 +200,13 @@ local function currentText(instance: Instance): string
 	return (instance :: any).Source
 end
 
--- An open script takes its new Source through the editor so the open tab follows.
+-- Assigning Source stops at 200,000 characters; UpdateSourceAsync goes past it. Past LARGE_SOURCE
+-- it is left to fail: multi-megabyte edits stalled the connect and reset a Team Create session.
+local SOURCE_CAP = 200000
+local LARGE_SOURCE = 1000000
+
+-- An open script takes its new Source through the editor so the open tab follows, and so does one
+-- past SOURCE_CAP (a big generated module would otherwise fail to sync and go missing).
 local function setSource(instance: Instance, source: string): boolean
 	if currentText(instance) == source and (instance :: any).Source == source then
 		return false
@@ -208,7 +214,7 @@ local function setSource(instance: Instance, source: string): boolean
 	local ok, document = pcall(function()
 		return ScriptEditorService:FindScriptDocument(instance :: any)
 	end)
-	if ok and document then
+	if (ok and document) or (#source >= SOURCE_CAP and #source < LARGE_SOURCE) then
 		if
 			pcall(function()
 				ScriptEditorService:UpdateSourceAsync(instance :: any, function()
