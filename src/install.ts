@@ -103,7 +103,10 @@ function installService(): string {
 		const dir = path.join(os.homedir(), ".config", "studio-sync");
 		fs.mkdirSync(dir, { recursive: true });
 		const cmd = path.join(dir, "run-daemon.cmd");
-		fs.writeFileSync(cmd, `@echo off\r\n:loop\r\n"${node}" "${CLI}" serve >> "${LOG_FILE}" 2>&1\r\ntimeout /t 3 /nobreak > nul\r\ngoto loop\r\n`);
+		// not LOG_FILE: the redirect locks its file, and the daemon's own log() then dies with EBUSY.
+		// ping, not `timeout`, which didn't wait in the launcher's hidden window.
+		const crashLog = path.join(dir, "daemon.out.log");
+		fs.writeFileSync(cmd, `@echo off\r\n:loop\r\n"${node}" "${CLI}" serve >> "${crashLog}" 2>&1\r\nping -n 4 127.0.0.1 > nul\r\ngoto loop\r\n`);
 		const vbs = path.join(windowsStartup(), "studio-sync.vbs");
 		fs.writeFileSync(vbs, `CreateObject("WScript.Shell").Run """${cmd}""", 0, False\r\n`);
 		spawn("wscript.exe", [vbs], { detached: true, stdio: "ignore" }).unref();
