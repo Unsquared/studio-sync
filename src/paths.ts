@@ -17,7 +17,7 @@ export const PROJECTS_FILE = path.join(STATE_DIR, "projects.json");
 export const STAGING_ROOT = path.join(STATE_DIR, "staging");
 // Studio-side text that disk replaced, files Studio deleted, the losing side of a conflict
 export const BACKUP_ROOT = path.join(STATE_DIR, "backups");
-export const LOG_FILE = process.env.STUDIO_SYNC_HOME
+export const LOG_FILE = process.env.STUDIO_SYNC_HOME || process.platform === "win32"
 	? path.join(STATE_DIR, "daemon.log")
 	: path.join(home, "Library", "Logs", "studio-sync.log");
 

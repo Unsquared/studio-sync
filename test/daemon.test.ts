@@ -7,11 +7,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 const PORT = 34990 + Math.floor(Math.random() * 8);
 const BASE = `http://127.0.0.1:${PORT}`;
 const PLACE = 4242;
-const ROOT = path.dirname(path.dirname(new URL(import.meta.url).pathname));
+const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "studio-sync-test-"));
 const home = path.join(tmp, "home");
 const project = path.join(tmp, "game");
