@@ -43,6 +43,8 @@ studio-sync pull 'Workspace["Odd.Name"]' assets/odd.rbxm       # names with dots
 
 A pulled instance under a root becomes a model file. That file syncs back to Studio. Pull it again after you change it in Studio. The "Save to disk" button in the Studio toolbar does the same for the selection.
 
+If several Studios are connected to the project (the dev place and copies), `pull` and `snapshot` refuse until you name one: `--from <session>` for a copy, `--from <placeId>` for the place. `studio-sync status` lists them.
+
 ## The whole place: snapshot and build
 
 ```bash
@@ -50,7 +52,7 @@ studio-sync snapshot     # everything in the open Studio the code files don't ow
 studio-sync build        # build/place.rbxl = code + place/ (+ place/base.rbxl's service settings)
 ```
 
-`snapshot` reads Studio directly: no saved version, no API key. Before you commit, review with `git status` and `git diff --stat place/`. The files are binary `.rbxm`, one for each top-level instance.
+`snapshot` reads Studio directly: no saved version, no API key. It replaces the snapshot dir, except `base.rbxl`. Before you commit, review with `git status` and `git diff --stat place/`. The files are binary `.rbxm`, one for each top-level instance.
 
 If `build` says there is no `place/base.rbxl`, ask the user once for a place file (Studio: File > Save to File). Then run `studio-sync base <file>`. Without it, the built place gets default Lighting and Workspace settings, and Studio shows migration dialogs.
 
@@ -65,7 +67,7 @@ studio-sync open                     # the project's published dev place instead
 
 A copy syncs with the checkout that made it, and with nothing else. Agents in different worktrees do not need `claim`, and they do not touch the dev place of anyone.
 
-Several Studios are then open. With the Studio MCP, `list_roblox_studios` shows the copy as `<checkout>-copy-<session>.rbxl`. Use that id. Changes to non-code content in a copy reach the repo only through `studio-sync snapshot` (run it while the copy is the Studio that connected most recently) or `pull`. You cannot publish a copy. Run `build` and publish the file.
+Several Studios are then open. With the Studio MCP, `list_roblox_studios` shows the copy as `<checkout>-copy-<session>.rbxl`. Use that id. Changes to non-code content in a copy reach the repo only through `studio-sync snapshot --from <session>` or `pull ... --from <session>`. You cannot publish a copy. Run `build` and publish the file.
 
 ## Status and fixes
 

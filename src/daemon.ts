@@ -8,7 +8,7 @@ import http from "node:http";
 import path from "node:path";
 import { PLUGIN_SOURCE_DIR, PORT, PROJECTS_FILE, STATE_DIR, VERSION } from "./paths.ts";
 import { log, logToFile } from "./log.ts";
-import { Project, type Command } from "./project.ts";
+import { Project, type Client, type Command } from "./project.ts";
 import { commit, plan, receiveFile } from "./snapshot.ts";
 import { Writer, saveBackup, type Op } from "./writeback.ts";
 
@@ -139,10 +139,34 @@ function settle(id: string, value: CommandResult): void {
 	waiters.get(id)?.(value);
 }
 
-// Queues a command for the Studio that polled last and waits for its result.
-function runCommand(project: Project, command: Omit<Command, "id" | "client" | "taken">, timeoutMs: number): Promise<CommandResult> {
-	const live = project.liveClients().sort((a, b) => b.lastSeen - a.lastSeen);
+function describeClient(c: Client): string {
+	return c.session ? `copy ${c.session}` : `place ${c.placeId}`;
+}
+
+// The Studio a command goes to: the one named by `from` (a copy's session or a place id), else the only
+// one connected. Several Studios and no `from` is refused: which one polled last is chance.
+function commandTarget(project: Project, from: string | null): Client {
+	const live = project.liveClients();
 	if (!live.length) throw new HttpError(409, "no Studio is connected to this project (open the place in Edit; studio-sync status)");
+	const connected = live.map(describeClient).join(", ");
+	if (from) {
+		const matches = live.filter((c) => c.session === from || (!c.session && String(c.placeId) === from));
+		if (matches.length === 1) return matches[0];
+		if (!matches.length) throw new HttpError(409, `no connected Studio is ${from} (connected: ${connected})`);
+		throw new HttpError(409, `${matches.length} Studios are ${from}: close all but one`);
+	}
+	if (live.length === 1) return live[0];
+	throw new HttpError(409, `${live.length} Studios are connected to this project (${connected}): name one with --from <copy session or place id>`);
+}
+
+// Queues a command for one Studio (`commandTarget`) and waits for its result.
+function runCommand(
+	project: Project,
+	command: Omit<Command, "id" | "client" | "taken">,
+	timeoutMs: number,
+	from: string | null,
+): Promise<CommandResult> {
+	const target = commandTarget(project, from);
 	const id = crypto.randomUUID();
 	return new Promise((resolve) => {
 		const timer = setTimeout(() => {
@@ -154,7 +178,7 @@ function runCommand(project: Project, command: Omit<Command, "id" | "client" | "
 			waiters.delete(id);
 			resolve(value);
 		});
-		project.commands.push({ ...command, id, client: live[0].id, taken: false });
+		project.commands.push({ ...command, id, client: target.id, taken: false });
 		project.wake();
 	});
 }
@@ -272,8 +296,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
 		if (!project) throw new HttpError(404, `no registered project contains ${q.get("dir")}`);
 		const result =
 			route === "/pull/request"
-				? await runCommand(project, { kind: "pull", path: JSON.parse(q.get("path") ?? "[]"), file: q.get("file") || undefined }, 60_000)
-				: await runCommand(project, { kind: "snapshot" }, 600_000);
+				? await runCommand(project, { kind: "pull", path: JSON.parse(q.get("path") ?? "[]"), file: q.get("file") || undefined }, 60_000, q.get("from"))
+				: await runCommand(project, { kind: "snapshot" }, 600_000, q.get("from"));
 		return json(res, result, result.ok ? 200 : 422);
 	}
 	if (route === "/command/result") {

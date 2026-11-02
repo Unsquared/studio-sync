@@ -105,6 +105,9 @@ export function commit(project: Project, token: string, report: Omit<Manifest, "
 	};
 	fs.writeFileSync(path.join(upload.dir, "snapshot.json"), JSON.stringify(manifest, null, "\t") + "\n");
 	const target = path.join(project.dir, snapshotDir(project));
+	// the base place is `base`'s, not the snapshot's: it stays (instances live in service folders, so no name clashes)
+	const base = path.join(target, "base.rbxl");
+	if (fs.existsSync(base)) fs.copyFileSync(base, path.join(upload.dir, "base.rbxl"));
 	if (fs.existsSync(target)) {
 		const backup = backupDir(project, "snapshot");
 		fs.mkdirSync(path.dirname(backup), { recursive: true });

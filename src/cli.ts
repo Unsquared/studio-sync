@@ -18,10 +18,12 @@ const USAGE = `studio-sync ${VERSION}: two-way sync between Roblox Studio and yo
   status [--json]        show the daemon, the projects, the connected Studios, and the errors
   wait [--timeout s]     wait until Studio applies every file change (exit 0).
                          Exit 2: no Studio. Exit 3: Studio reported errors. Exit 4: timeout.
-  pull <Instance.Path> [file]
+  pull <Instance.Path> [file] [--from <copy session | place id>]
                          save a Studio instance into the repo as .rbxm (models, parts, maps)
-  snapshot               save the whole open place, except the project code,
-                         into the repo (snapshot.dir, default place/)
+  snapshot [--from <copy session | place id>]
+                         save the whole open place, except the project code,
+                         into the repo (snapshot.dir, default place/; base.rbxl stays)
+                         With several Studios connected to the project, --from names the one.
   build [-o file] [--code-only]
                          build a place file from the project and the snapshot (default build/place.rbxl)
   base <place.rbxl>      keep the service settings of a place file (not its content)
@@ -94,6 +96,15 @@ function projectAt(from: string): { dir: string; config: any } {
 function flag(args: string[], name: string): string | undefined {
 	const at = args.indexOf(name);
 	return at >= 0 ? args[at + 1] : undefined;
+}
+
+// The Studio a pull or snapshot goes to (`--from`), as the daemon's query, and the arguments without it.
+function fromFlag(args: string[]): { from: Record<string, string>; rest: string[] } {
+	const at = args.indexOf("--from");
+	if (at < 0) return { from: {}, rest: args };
+	const value = args[at + 1];
+	if (!value || value.startsWith("-")) fail("--from needs a copy session or a place id (studio-sync status lists them)");
+	return { from: { from: value }, rest: args.filter((_, i) => i !== at && i !== at + 1) };
 }
 
 // "ReplicatedStorage.shared.Thing" or "game.Workspace.Map"; names with dots go in brackets: Workspace["a.b"]
@@ -195,12 +206,14 @@ const commands: Record<string, (args: string[]) => Promise<void> | void> = {
 		console.log(`${result.project} v${result.version}: Studio is in sync`);
 	},
 	async pull(args) {
-		const [instance, file] = args;
-		if (!instance) fail("usage: studio-sync pull <Instance.Path> [file]");
+		const { from, rest } = fromFlag(args);
+		const [instance, file] = rest;
+		if (!instance) fail("usage: studio-sync pull <Instance.Path> [file] [--from <copy session | place id>]");
 		const query = new URLSearchParams({
 			dir: process.cwd(),
 			path: JSON.stringify(parseInstancePath(instance)),
 			file: file ? path.relative(target([]), path.resolve(file)) : "",
+			...from,
 		});
 		const response = await api(`/pull/request?${query}`, { method: "POST" });
 		const text = await response.text();
@@ -213,8 +226,9 @@ const commands: Record<string, (args: string[]) => Promise<void> | void> = {
 		if (!result.ok) fail(result.error ?? text);
 		console.log(`saved ${instance} to ${result.file}`);
 	},
-	async snapshot() {
-		const response = await api(`/snapshot/request?dir=${encodeURIComponent(process.cwd())}`, { method: "POST" });
+	async snapshot(args) {
+		const query = new URLSearchParams({ dir: process.cwd(), ...fromFlag(args).from });
+		const response = await api(`/snapshot/request?${query}`, { method: "POST" });
 		const text = await response.text();
 		let result: any;
 		try {

@@ -37,7 +37,7 @@ Studio requests carry `placeId`. Plugin requests also carry `client` (a GUID for
 |---|---|
 | `GET /status` | every project, its clients, and its errors |
 | `GET /wait?dir&timeout` | regenerates now, then waits until every live client acknowledges the current version: `{ ok, reason?: "no-studio" \| "timeout", version, error, clients }` |
-| `POST /pull/request?dir&path&file` | queues a pull command for the Studio of the project and waits (60 s) for the result |
-| `POST /snapshot/request?dir` | queues a snapshot command for the Studio of the project and waits (600 s) |
+| `POST /pull/request?dir&path&file&from` | queues a pull command for a Studio of the project and waits (60 s) for the result |
+| `POST /snapshot/request?dir&from` | queues a snapshot command for a Studio of the project and waits (600 s) |
 
-Commands (`pull`, `snapshot`) go in the `commands` field of `/changes` responses. The daemon sends them to the client it saw most recently.
+Commands (`pull`, `snapshot`) go in the `commands` field of `/changes` responses. The daemon sends them to the client that `from` names (a copy's `session`, or the `placeId` of a client that is not a copy), else to the only live client. With several live clients and no `from`, or a `from` that matches no client or more than one, the request gets 409 with the connected clients in the message.

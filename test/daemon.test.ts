@@ -85,9 +85,14 @@ before(async () => {
 	}, 20000);
 });
 
-after(() => {
-	daemon?.kill();
-	fs.rmSync(tmp, { recursive: true, force: true });
+after(async () => {
+	if (daemon && daemon.exitCode === null) {
+		const exited = new Promise((resolve) => daemon.once("exit", resolve));
+		daemon.kill();
+		await exited;
+	}
+	// Windows holds a killed process's files a moment longer
+	fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test("the tree carries every file kind", () => {
@@ -202,4 +207,64 @@ test("pull saves a serialized instance as .rbxm", async () => {
 	const result = await (await pulled).json();
 	assert.equal(result.ok, true, JSON.stringify(result));
 	assert.equal(fs.readFileSync(path.join(project, "src/shared/Tree.rbxm"), "utf8"), "fake rbxm bytes");
+});
+
+test("a snapshot replaces the snapshot dir but keeps base.rbxl", async () => {
+	write("place/base.rbxl", "base place bytes");
+	write("place/Workspace/Old.rbxm", "stale");
+	const snapshotted = fetch(`${BASE}/snapshot/request?dir=${encodeURIComponent(project)}`, { method: "POST" });
+	tree = await get("/tree");
+	const delta = await until(async () => {
+		const d = await get(`/changes?epoch=${tree.epoch}&since=${tree.version}&wait=1`);
+		return d.commands?.length ? d : undefined;
+	});
+	const command = delta.commands[0];
+	assert.equal(command.kind, "snapshot");
+	const map = encodeURIComponent(JSON.stringify(["Workspace", "Map"]));
+	await fetch(`${BASE}/snapshot/file?placeId=${PLACE}&upload=s1&path=${map}&last=1`, {
+		method: "POST",
+		body: Buffer.from("map bytes").toString("base64"),
+	});
+	const report = { placeId: PLACE, entries: [{ path: ["Workspace", "Map"], className: "Model" }], services: {}, skipped: [], duplicates: [] };
+	await fetch(`${BASE}/snapshot/commit?placeId=${PLACE}&upload=s1&id=${command.id}`, { method: "POST", body: JSON.stringify(report) });
+	const result = await (await snapshotted).json();
+	assert.equal(result.ok, true, JSON.stringify(result));
+	assert.equal(fs.readFileSync(path.join(project, "place/Workspace/Map.rbxm"), "utf8"), "map bytes");
+	assert.ok(!fs.existsSync(path.join(project, "place/Workspace/Old.rbxm")), "the rest of the old snapshot is replaced");
+	assert.equal(fs.readFileSync(path.join(project, "place/base.rbxl"), "utf8"), "base place bytes");
+});
+
+test("with several Studios connected, a command goes only where --from says", async () => {
+	const session = "c0ffee00";
+	const registry = JSON.parse(fs.readFileSync(path.join(home, "projects.json"), "utf8"));
+	registry.sessions = { [session]: { dir: project, file: path.join(tmp, "copy.rbxl"), createdAt: new Date().toISOString() } };
+	fs.writeFileSync(path.join(home, "projects.json"), JSON.stringify(registry));
+	const asCopy = (route: string) => `${BASE}${route}${route.includes("?") ? "&" : "?"}placeId=0&client=copy-client&plugin=test&session=${session}`;
+	const copyTree = await until(async () => {
+		const r = await fetch(asCopy("/tree"));
+		return r.status === 200 ? r.json() : undefined;
+	});
+	await get("/tree"); // the place's Studio is live too
+
+	const request = (from?: string) => {
+		const query = new URLSearchParams({ dir: project, path: JSON.stringify(["Workspace", "Thing"]), ...(from ? { from } : {}) });
+		return fetch(`${BASE}/pull/request?${query}`, { method: "POST" });
+	};
+	const ambiguous = await request();
+	assert.equal(ambiguous.status, 409);
+	assert.match(await ambiguous.text(), new RegExp(`copy ${session}.*place ${PLACE}|place ${PLACE}.*copy ${session}`));
+	const unknown = await request("nope");
+	assert.equal(unknown.status, 409);
+	assert.match(await unknown.text(), /no connected Studio is nope/);
+
+	const pulled = request(session);
+	const delta = await until(async () => {
+		const d = await (await fetch(asCopy(`/changes?epoch=${copyTree.epoch}&since=${copyTree.version}&wait=1`))).json();
+		return d.commands?.length ? d : undefined;
+	});
+	const placeDelta = await get(`/changes?epoch=${tree.epoch}&since=${tree.version}&wait=1`);
+	assert.deepEqual(placeDelta.commands ?? [], [], "the place's Studio is not asked");
+	await fetch(asCopy(`/pull?id=${delta.commands[0].id}&error=${encodeURIComponent("answered by the copy")}`), { method: "POST" });
+	const result = await (await pulled).json();
+	assert.equal(result.error, "answered by the copy");
 });

@@ -30,8 +30,8 @@ Then, in each project, run `studio-sync add` and put your dev place id in `studi
 | `add` / `remove` / `claim` | register a project / unregister it / make this checkout sync its places (worktrees) |
 | `status` / `log` | show what syncs, errors, and the daemon log |
 | `wait` | wait until Studio has every file change (exit 0 in sync, 2 no Studio, 3 errors, 4 timeout) |
-| `pull <Instance.Path> [file]` | save one Studio instance as `.rbxm` |
-| `snapshot` | save the whole open place, except code, into `place/` |
+| `pull <Instance.Path> [file]` | save one Studio instance as `.rbxm` (`--from <session or placeId>` when several Studios are connected) |
+| `snapshot` | save the whole open place, except code, into `place/`; `base.rbxl` stays (`--from` as for `pull`) |
 | `base <place.rbxl>` | keep the service settings of a real place file (once for each project) |
 | `build` | make `build/place.rbxl` from code + snapshot + base |
 | `open` / `open --copy` / `close` | open the dev place / open a private copy / close the copies |
