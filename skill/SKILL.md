@@ -59,7 +59,7 @@ If `build` says there is no `place/base.rbxl`, ask the user once for a place fil
 ## Your own Studio: copies
 
 ```bash
-studio-sync open --copy              # build from this checkout, open in a new Studio (background), wait until synced
+studio-sync open --copy              # build from this checkout (or with the project's `copy` command), open in a new Studio (background), wait until synced
 studio-sync open --copy --code-only  # faster, no snapshot: code only
 studio-sync close                    # done: closes this checkout's copy, no save (snapshot first if it has non-code changes)
 studio-sync open                     # the project's published dev place instead

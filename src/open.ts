@@ -8,9 +8,9 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { BACKUP_ROOT, PORT, STATE_DIR } from "./paths.ts";
+import { BACKUP_ROOT, PORT, ROOT, STATE_DIR } from "./paths.ts";
 import { readRegistry, writeRegistry } from "./daemon.ts";
-import { build } from "./snapshot.ts";
+import { build, run } from "./snapshot.ts";
 
 export const COPIES_DIR = path.join(STATE_DIR, "copies");
 
@@ -99,19 +99,37 @@ export async function openPlace(dir: string, placeId: number, timeoutS: number):
 	return [`opened place ${placeId}: ${state}`];
 }
 
+export type CopyConfig = { command: string[]; output: string };
+
+// A project that builds its own full place (`copy`): run its command, then stamp the session.
+function buildWithCommand(dir: string, copy: CopyConfig, file: string, session: string): string[] {
+	if (!Array.isArray(copy.command) || !copy.command.length || typeof copy.output !== "string") {
+		throw new Error('studio-sync.json "copy" needs "command" (a list: the program, then its arguments) and "output" (the place file it writes)');
+	}
+	const [command, ...args] = copy.command;
+	run(command, args, dir);
+	const output = path.resolve(dir, copy.output);
+	if (!fs.existsSync(output)) throw new Error(`${copy.command.join(" ")} did not write ${copy.output}`);
+	run("lune", ["run", path.join(ROOT, "lune", "session.luau"), output, file, session], ROOT); // lune is pinned in our rokit.toml
+	return [`built ${copy.output} with ${copy.command.join(" ")}`];
+}
+
 export async function openCopy(
 	dir: string,
-	config: { project: string; snapshot?: { dir?: string } | null },
+	config: { project: string; snapshot?: { dir?: string } | null; copy?: CopyConfig | null },
 	options: { codeOnly: boolean; timeoutS: number },
 ): Promise<string[]> {
 	const session = crypto.randomBytes(4).toString("hex");
 	fs.mkdirSync(COPIES_DIR, { recursive: true });
 	const file = path.join(COPIES_DIR, `${path.basename(dir)}-copy-${session}.rbxl`);
-	const lines = build(dir, config, {
-		output: file,
-		snapshot: !options.codeOnly,
-		attributes: { StudioSyncSession: { String: session } },
-	});
+	const lines =
+		config.copy && !options.codeOnly
+			? buildWithCommand(dir, config.copy, file, session)
+			: build(dir, config, {
+					output: file,
+					snapshot: !options.codeOnly,
+					attributes: { StudioSyncSession: { String: session } },
+				});
 	const registry = readRegistry();
 	if (!registry.projects.includes(dir)) registry.projects.push(dir);
 	registry.sessions[session] = { dir, file, createdAt: new Date().toISOString() };

@@ -163,7 +163,7 @@ export function buildProject(dir: string, config: { project: string; snapshot?: 
 	return { project, base, notes };
 }
 
-function run(command: string, args: string[], cwd: string): string {
+export function run(command: string, args: string[], cwd: string): string {
 	const result = spawnSync(command, args, { cwd, encoding: "utf8", shell: process.platform === "win32" });
 	if (result.error) throw new Error(`${command}: ${result.error.message} (is it installed? rokit install)`);
 	if (result.status !== 0) throw new Error(`${command} ${args[0]}: ${(result.stderr || result.stdout).trim()}`);

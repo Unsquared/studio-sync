@@ -11,7 +11,8 @@
 	"writeback": true,
 	"sourcemap": true,
 	"content": { "dir": "places/main", "sources": ["src/shared/meshes.luau"] },
-	"snapshot": { "dir": "place", "ignore": [["Workspace", "Temp"]] }
+	"snapshot": { "dir": "place", "ignore": [["Workspace", "Temp"]] },
+	"copy": { "command": ["lune", "run", "build", "dev", "main"], "output": "build/main.rbxl" }
 }
 ```
 
@@ -22,6 +23,7 @@
 - `sourcemap`: also write `sourcemap.json` when files change.
 - `content`: the bake receiver (`POST /content/*`). A Studio script posts `.rbxm` files that replace `dir`. `bake.json` there records the sha256 of each file in `sources`, so a build can refuse a stale bake.
 - `snapshot`: `dir` is where `snapshot` saves the place (default `place`). `ignore` lists the paths that `snapshot` leaves out.
+- `copy`: for a project that builds its full place itself (its content kept in another format than a snapshot). `open --copy` runs `command` in the project dir, then opens `output` with the copy's session stamped on it. `open --copy --code-only` still builds code only.
 
 `studio-sync.local.json` (add it to `.gitignore`) overrides these keys for one person, usually their own `placeIds`. Config changes apply without a restart.
 
