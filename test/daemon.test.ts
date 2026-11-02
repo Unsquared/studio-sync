@@ -268,3 +268,23 @@ test("with several Studios connected, a command goes only where --from says", as
 	const result = await (await pulled).json();
 	assert.equal(result.error, "answered by the copy");
 });
+
+test("a closed copy stops counting at once, so the place is the only Studio again", async () => {
+	const registry = JSON.parse(fs.readFileSync(path.join(home, "projects.json"), "utf8"));
+	registry.sessions = {};
+	fs.writeFileSync(path.join(home, "projects.json"), JSON.stringify(registry));
+	await until(async () => {
+		const status = await get("/status");
+		const clients = status.projects.flatMap((p: any) => p.clients);
+		return clients.some((c: any) => c.session) ? undefined : true;
+	});
+	const query = new URLSearchParams({ dir: project, path: JSON.stringify(["Workspace", "Thing"]) });
+	const pulled = fetch(`${BASE}/pull/request?${query}`, { method: "POST" });
+	const delta = await until(async () => {
+		const d = await get(`/changes?epoch=${tree.epoch}&since=${tree.version}&wait=1`);
+		return d.commands?.length ? d : undefined;
+	});
+	await fetch(`${BASE}/pull?placeId=${PLACE}&client=${client}&plugin=test&id=${delta.commands[0].id}&error=${encodeURIComponent("answered by the place")}`, { method: "POST" });
+	const result = await (await pulled).json();
+	assert.equal(result.error, "answered by the place");
+});

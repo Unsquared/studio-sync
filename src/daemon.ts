@@ -62,6 +62,15 @@ function refreshRegistry(): void {
 			log(`added ${dir}`);
 		}
 	}
+	// a closed copy is gone now, not at its TTL: `wait` and a pull or snapshot without --from don't count it
+	for (const project of projects.values()) {
+		for (const [id, c] of project.clients) {
+			if (c.session && !sessions[c.session]) {
+				project.clients.delete(id);
+				log(`[${project.name}] Studio disconnected (copy ${c.session} closed)`);
+			}
+		}
+	}
 }
 
 type Lookup = { project: Project } | { status: number; message: string };
