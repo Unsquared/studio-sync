@@ -1,8 +1,8 @@
 # studio-sync
 
-Two-way sync between Roblox Studio and a Rojo project, for coding agents. It replaces `rojo serve`.
+Sync between Roblox Studio and a Rojo project, for coding agents. It replaces `rojo serve`.
 
-- Files go to Studio in less than one second. Studio edits to scripts go back to the files.
+- Files go to Studio in less than one second. Code is edited on disk; models (`.rbxm`) edited in Studio save back to their files.
 - `snapshot` saves the whole place (maps, UI, lighting) into the repo. `build` makes a place file to publish.
 - `open --copy` gives each agent its own private copy of the place.
 
@@ -10,16 +10,18 @@ Agents: read [`skill/SKILL.md`](skill/SKILL.md). It has the full workflow.
 
 ## Install
 
-You need Node 23.6+ and `rojo` in each project (rokit). Do this once on each machine:
+With [rokit](https://github.com/rojo-rbx/rokit), once on each machine:
 
 ```bash
-git clone git@github.com:Unsquared/studio-sync.git ~/Work/studio-sync
-cd ~/Work/studio-sync && npm link && studio-sync install
+rokit add --global Unsquared/studio-sync
+studio-sync install
 ```
+
+`install` starts the background daemon (one for all projects, so install it globally, not per repo) and writes the Studio plugin and the agent skill, which the binary carries. Live sync reads the Rojo project file itself; only `build` and `open --copy` run `rojo` (rokit, in the project).
 
 When Studio asks to allow HTTP for "Studio Sync", allow it. Do not connect the Rojo plugin to synced places.
 
-To update, run `git pull && studio-sync install`.
+To update, run `rokit update --global studio-sync && studio-sync install`, then restart Studio.
 
 Then, in each project, run `studio-sync add` and put your dev place id in `studio-sync.json`.
 
@@ -31,9 +33,8 @@ Then, in each project, run `studio-sync add` and put your dev place id in `studi
 | `status` / `log` | show what syncs, errors, and the daemon log |
 | `wait` | wait until Studio has every file change (exit 0 in sync, 2 no Studio, 3 errors, 4 timeout) |
 | `pull <Instance.Path> [file]` | save one Studio instance as `.rbxm` (`--from <session or placeId>` when several Studios are connected) |
-| `snapshot` | save the whole open place, except code, into `place/`; `base.rbxl` stays (`--from` as for `pull`) |
-| `base <place.rbxl>` | keep the service settings of a real place file (once for each project) |
-| `build` | make `build/place.rbxl` from code + snapshot + base |
+| `snapshot` | save the whole open place, except code, into `place/` (`--from` as for `pull`) |
+| `build` | make `build/place.rbxl` from code + snapshot |
 | `open` / `open --copy` / `close` | open the dev place / open a private copy / close the copies |
 | `install` / `restart` / `serve` | machine setup |
 
@@ -51,11 +52,11 @@ Then, in each project, run `studio-sync add` and put your dev place id in `studi
 
 ## Rules
 
-- **Disk wins.** If a script changed on disk and in Studio, the tool keeps the disk version.
-- **Connect makes Studio match the disk.** Under the roots, Studio-only scripts and instances are removed.
+- **Disk wins for code, Studio wins for models.** Script edits in Studio are not saved. On a connect, Studio's `.rbxm` models are saved over their files; `git checkout` a file to take the git version instead.
+- **Connect makes Studio's code match the disk.** Under the roots, Studio-only scripts and instances are removed.
 - **Nothing is lost.** The tool copies all that it overwrites or deletes to `~/.config/studio-sync/backups/`.
 - **One syncer for each place.** Use your own dev place, never the live place.
 
 ## Develop
 
-Run `npm run check` and `npm test`. [`CLAUDE.md`](CLAUDE.md) has the contributor rules. [`docs/protocol.md`](docs/protocol.md) has the HTTP API. Windows is not tested yet: see the checklist in `CLAUDE.md`.
+From a checkout: `cargo install --path . && studio-sync install` runs your build. Run `cargo clippy --all-targets` and `cargo test`. A tag `v<version>` (the version in Cargo.toml) publishes the release binaries. [`CLAUDE.md`](CLAUDE.md) has the contributor rules. [`docs/protocol.md`](docs/protocol.md) has the HTTP and WebSocket protocol. Windows is not tested yet: see the checklist in `CLAUDE.md`.

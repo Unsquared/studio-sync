@@ -1,0 +1,35 @@
+# Lint and the end-to-end test on both platforms the tool supports.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            rojo: macos-aarch64
+          - os: windows-latest
+            rojo: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # the Rojo that rokit.toml pins; the tests need it on PATH
+      - name: Install Rojo
+        shell: bash
+        run: |
+          version=$(sed -n 's/^rojo = "rojo-rbx\/rojo@\(.*\)"/\1/p' rokit.toml)
+          curl -sSfL -o rojo.zip "https://github.com/rojo-rbx/rojo/releases/download/v$version/rojo-$version-${{ matrix.rojo }}.zip"
+          mkdir -p "$RUNNER_TEMP/rojo" && unzip -q rojo.zip -d "$RUNNER_TEMP/rojo"
+          echo "$RUNNER_TEMP/rojo" >> "$GITHUB_PATH"
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test

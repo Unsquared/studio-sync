@@ -1,0 +1,27 @@
+[package]
+name = "studio-sync"
+version = "3.0.0"
+edition = "2024"
+description = "Two-way sync between Roblox Studio and a Rojo project, built for agents: an always-on daemon plus a Studio plugin"
+
+[dependencies]
+base64 = "0.23.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+getrandom = "0.4.3"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+notify = "8.2.1"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha1 = "0.11.0"
+sha2 = "0.11.1"
+sysinfo = "0.40.1"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "macros", "time", "sync"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+ureq = { version = "3.5.1", default-features = false, features = ["native-tls-no-default"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

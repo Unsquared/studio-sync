@@ -2,21 +2,27 @@
 	Studio side of studio-sync. Asks the daemon (localhost:34999) for the
 	project that owns this place id, applies its full tree, then both ways:
 
-	- disk -> Studio: long-polls /changes and applies each delta (creates,
+	- disk -> Studio: holds a WebSocket open to the daemon, which says when a
+	  new version is out; then reads /changes and applies the delta (creates,
 	  deletes, moves, Source, properties, attributes, .rbxm models);
-	- Studio -> disk: watches the synced roots and posts edits to /writeback
-	  (Source, new scripts and folders, renames, moves, deletes). Disk wins a
-	  conflict; Studio's text is saved in the daemon's backups.
+	- Studio -> disk: models only. A synced .rbxm model edited in Studio is saved
+	  over its file once Studio is quiet (/save). Studio is the source of truth
+	  for models: a connect saves Studio's models over their files, and a file
+	  change waits while Studio has an unsaved edit; a file Studio replaces goes
+	  to the daemon's backups. A file change with no edit pending loads in
+	  Studio (a git pull). Scripts are edited on disk: a Studio edit is not
+	  saved, and the next disk change replaces it.
 
 	Other instances (Parts, models, values) made in Studio are saved with
-	Sync.pull (the toolbar's "Save to disk", or `studio-sync pull` from a shell).
+	Sync.pull (the toolbar's "Save to disk", or `studio-sync pull` from a shell);
+	after that they are synced models too.
 
 	No dependency on the `plugin` global, so the same source runs from the
 	plugin, the command bar or an MCP:
 
 		local Sync = loadstring(game:GetService("HttpService"):GetAsync("http://localhost:34999/plugin/sync.luau"))()
 		local s = Sync.new({ writeback = false })
-		print(Sync.connect(s))      -- one full sync; Sync.poll(s) applies one delta
+		print(Sync.connect(s))      -- one full sync; Sync.poll(s) applies the changes since
 ]]
 
 local CollectionService = game:GetService("CollectionService")
@@ -25,12 +31,12 @@ local HttpService = game:GetService("HttpService")
 local ScriptEditorService = game:GetService("ScriptEditorService")
 local SerializationService = game:GetService("SerializationService")
 
-local PLUGIN_VERSION = "2.1.1"
+local PLUGIN_VERSION = "3.0.0"
 local DEFAULT_URL = "http://localhost:34999"
 local RETRY_OFFLINE = 3
 local RETRY_UNKNOWN = 6
-local SOURCE_DEBOUNCE = 0.6
-local STRUCTURE_DEBOUNCE = 0.4
+-- seconds of quiet before an edited model is saved
+local MODEL_DEBOUNCE = 1
 -- HttpService posts at most 1 MB; parts stay under it
 local POST_LIMIT = 900 * 1024
 local SEP = "\0"
@@ -71,8 +77,8 @@ function Sync.new(options: { [string]: any })
 	return {
 		base = options.base or DEFAULT_URL,
 		placeId = options.placeId or game.PlaceId,
-		-- a copy made by `studio-sync open --copy` names its checkout through this attribute
-		session = options.session or workspace:GetAttribute("StudioSyncSession"),
+		-- a copy made by `studio-sync open --copy` is the file <checkout>-copy-<session>.rbxl
+		session = options.session or string.match(game.Name, "%-copy%-(%x+)%.rbxl$"),
 		clientId = HttpService:GenerateGUID(false),
 		log = options.log or print,
 		onStatus = options.onStatus,
@@ -85,18 +91,20 @@ function Sync.new(options: { [string]: any })
 		version = 0,
 		roots = {},
 		writeback = false,
+		socket = nil, -- the WebStreamClient while it is open
+		latest = nil, -- the newest { epoch, version } the daemon announced
+		rung = false, -- the loop has something to look at
+		waiting = nil, -- the loop's thread while it waits for that
 		known = {}, -- key -> { path, className, kind, ro, hash, source, sourceHash, modelHash, instance }
 		byInstance = {}, -- Instance -> key
-		dirtySource = {}, -- Instance -> os.clock() of the last edit
-		structureAt = nil, -- os.clock() of the last structural change, nil when none
-		rejected = {}, -- Instance -> true: the daemon refused it; left alone until the next full sync
 		adopt = {}, -- key -> true: a pulled instance becomes its model node without being replaced
-		hooked = {}, -- Instance -> { RBXScriptConnection }
+		modelHooks = {}, -- key -> { instance, list = { RBXScriptConnection } }: models watched for edits
+		dirtyModels = {}, -- key -> os.clock() of the model's last edit
+		saveScheduled = false,
+		saving = false, -- a model save is in flight
 		connections = {},
 		warned = {},
 		errors = {},
-		unsaved = {},
-		reportedUnsaved = "",
 	}
 end
 
@@ -106,6 +114,10 @@ local function url(s, path: string): string
 	local separator = if string.find(path, "?", 1, true) then "&" else "?"
 	local session = if s.session then `&session={s.session}` else ""
 	return `{s.base}{path}{separator}placeId={s.placeId}{session}&client={s.clientId}&plugin={PLUGIN_VERSION}`
+end
+
+local function socketUrl(s, path: string): string
+	return (string.gsub(url(s, path), "^http", "ws"))
 end
 
 -- Returns the status code and body; raises only when the daemon is unreachable.
@@ -200,10 +212,8 @@ local function currentText(instance: Instance): string
 	return (instance :: any).Source
 end
 
--- Assigning Source stops at 200,000 characters; UpdateSourceAsync goes past it. Past LARGE_SOURCE
--- it is left to fail: multi-megabyte edits stalled the connect and reset a Team Create session.
+-- Assigning Source stops at 200,000 characters; UpdateSourceAsync has no such cap.
 local SOURCE_CAP = 200000
-local LARGE_SOURCE = 1000000
 
 -- An open script takes its new Source through the editor so the open tab follows, and so does one
 -- past SOURCE_CAP (a big generated module would otherwise fail to sync and go missing).
@@ -214,7 +224,7 @@ local function setSource(instance: Instance, source: string): boolean
 	local ok, document = pcall(function()
 		return ScriptEditorService:FindScriptDocument(instance :: any)
 	end)
-	if (ok and document) or (#source >= SOURCE_CAP and #source < LARGE_SOURCE) then
+	if (ok and document) or #source >= SOURCE_CAP then
 		if
 			pcall(function()
 				ScriptEditorService:UpdateSourceAsync(instance :: any, function()
@@ -387,6 +397,18 @@ end
 
 -- -- known: what the plugin last saw on disk -----------------------------------
 
+local function unhook(s, key: string)
+	local hooks = s.modelHooks[key]
+	if hooks then
+		s.modelHooks[key] = nil
+		for _, connection in hooks.list do
+			connection:Disconnect()
+		end
+	end
+end
+
+local hookModel
+
 local function remember(s, node: any, instance: Instance)
 	local key = keyOf(node.path)
 	local previous = s.known[key]
@@ -405,6 +427,12 @@ local function remember(s, node: any, instance: Instance)
 		instance = instance,
 	}
 	s.byInstance[instance] = key
+	-- Studio serializes to binary: an XML .rbxmx stays read-only
+	if node.kind == "model" and node.ro ~= true and string.sub(node.model or "", -5) == ".rbxm" then
+		hookModel(s, key, instance)
+	else
+		unhook(s, key)
+	end
 end
 
 local function forget(s, path: { string })
@@ -412,233 +440,13 @@ local function forget(s, path: { string })
 	for key, entry in s.known do
 		if key == prefix or string.sub(key, 1, #prefix + 1) == prefix .. SEP then
 			s.known[key] = nil
+			unhook(s, key)
 			if s.byInstance[entry.instance] == key then
 				s.byInstance[entry.instance] = nil
 			end
 		end
 	end
 end
-
-local function rekey(s, from: { string }, to: { string })
-	local prefix = keyOf(from)
-	local moved = {}
-	for key, entry in s.known do
-		if key == prefix or string.sub(key, 1, #prefix + 1) == prefix .. SEP then
-			s.known[key] = nil
-			local path = table.clone(to)
-			for index = #from + 1, #entry.path do
-				table.insert(path, entry.path[index])
-			end
-			entry.path = path
-			table.insert(moved, entry)
-		end
-	end
-	for _, entry in moved do
-		local key = keyOf(entry.path)
-		s.known[key] = entry
-		s.byInstance[entry.instance] = key
-	end
-end
-
-local function structural(entry: any): boolean
-	return not entry.ro and (entry.kind == "script" or entry.kind == "init" or entry.kind == "dir")
-end
-
--- -- disk -> Studio ------------------------------------------------------------
-
-type Counts = { created: number, updated: number, removed: number }
-
-local function loadModel(s, node: any): Instance
-	local status, body = request(s, "GET", `/model?file={HttpService:UrlEncode(node.model)}`)
-	if status ~= 200 then
-		error(`{node.model}: daemon answered {status}: {body}`)
-	end
-	local blob = EncodingService:Base64Decode(buffer.fromstring(body))
-	local instances = SerializationService:DeserializeInstancesAsync(blob)
-	assert(#instances == 1, `{node.model} holds {#instances} root instances; a model file needs exactly one`)
-	return instances[1]
-end
-
-local function applyModel(s, node: any, counts: Counts): Instance?
-	local key = keyOf(node.path)
-	local existing = find(node.path)
-	local previous = s.known[key]
-	if
-		existing
-		and (s.adopt[key] or (previous and previous.instance == existing and previous.modelHash == node.modelHash))
-	then
-		s.adopt[key] = nil
-		return existing
-	end
-	local parentPath = table.clone(node.path)
-	table.remove(parentPath)
-	local parent = if #parentPath == 1 then getService(parentPath[1]) else resolve(parentPath, "Folder")
-	assert(parent, `no parent for {display(node.path)}`)
-	local loaded = loadModel(s, node)
-	loaded.Name = node.path[#node.path]
-	if existing then
-		existing:Destroy()
-		counts.removed += 1
-	end
-	loaded.Parent = parent
-	counts.created += 1
-	return loaded
-end
-
--- Returns the instance and the node to remember (with the old base when Studio's edit is pending).
-local function applyNode(s, node: any, counts: Counts, errors: { string }): (Instance?, any)
-	if node.error then
-		table.insert(errors, node.error)
-	end
-	if node.kind == "model" then
-		return applyModel(s, node, counts), node
-	end
-	local instance, created = resolve(node.path, node.className)
-	if not instance then
-		table.insert(errors, `{display(node.path)}: no service {node.path[1]}`)
-		return nil, node
-	end
-	if created then
-		counts.created += 1
-	end
-	local key = keyOf(node.path)
-	local previous = s.known[key]
-	if node.source and isScript(instance) then
-		if s.dirtySource[instance] and currentText(instance) ~= node.source and previous then
-			-- edited in Studio and on disk: keep the old base so the writeback reports a conflict
-			node = table.clone(node)
-			node.hash = nil
-			node.source = previous.source
-			node.sourceHash = previous.sourceHash
-		elseif setSource(instance, node.source) then
-			counts.updated += 1
-		end
-	end
-	if node.runContext and (instance :: any).RunContext ~= Enum.RunContext[node.runContext] then
-		(instance :: any).RunContext = Enum.RunContext[node.runContext]
-	end
-	if node.properties then
-		setProperties(instance, node.properties, errors)
-	end
-	if node.attributes then
-		for name, value in node.attributes do
-			local ok, err = pcall(instance.SetAttribute, instance, name, decodeAttribute(value))
-			if not ok then
-				table.insert(errors, `{instance:GetFullName()} attribute {name}: {err}`)
-			end
-		end
-	end
-	return instance, node
-end
-
-local function byDepth(a: any, b: any): boolean
-	return #a.path < #b.path
-end
-
-local function report(s, errors: { string })
-	local unsaved = table.concat(s.unsaved, "\n")
-	if #errors == 0 and #s.errors == 0 and unsaved == s.reportedUnsaved then
-		return
-	end
-	s.errors = errors
-	s.reportedUnsaved = unsaved
-	for _, err in errors do
-		s.log(`[studio-sync] {err}`)
-	end
-	pcall(postJson, s, "/report", { version = s.version, errors = errors, unsaved = s.unsaved })
-end
-
-local function summary(counts: Counts): string
-	return `created {counts.created}, updated {counts.updated}, removed {counts.removed}`
-end
-
--- -- Studio -> disk: watching ----------------------------------------------------
-
-local function inRoots(s, instance: Instance): boolean
-	for _, root in s.rootInstances or {} do
-		if instance == root or instance:IsDescendantOf(root) then
-			return true
-		end
-	end
-	return false
-end
-
-local function markStructure(s)
-	s.structureAt = os.clock()
-end
-
-local function hook(s, instance: Instance)
-	if s.hooked[instance] or not (isScript(instance) or instance:IsA("Folder")) then
-		return
-	end
-	local list = {
-		instance:GetPropertyChangedSignal("Name"):Connect(function()
-			markStructure(s)
-		end),
-	}
-	if isScript(instance) then
-		table.insert(
-			list,
-			instance:GetPropertyChangedSignal("Source"):Connect(function()
-				s.dirtySource[instance] = os.clock()
-			end)
-		)
-	end
-	s.hooked[instance] = list
-end
-
-local function unhookAll(s)
-	for _, list in s.hooked do
-		for _, connection in list do
-			connection:Disconnect()
-		end
-	end
-	for _, connection in s.connections do
-		connection:Disconnect()
-	end
-	s.hooked, s.connections = {}, {}
-end
-
-local function watch(s)
-	unhookAll(s)
-	s.rootInstances = {}
-	for _, root in s.roots do
-		local instance = find(root)
-		if instance then
-			table.insert(s.rootInstances, instance)
-			hook(s, instance)
-			for _, descendant in instance:GetDescendants() do
-				hook(s, descendant)
-			end
-			table.insert(
-				s.connections,
-				instance.DescendantAdded:Connect(function(descendant)
-					hook(s, descendant)
-					markStructure(s)
-				end)
-			)
-			table.insert(
-				s.connections,
-				instance.DescendantRemoving:Connect(function()
-					markStructure(s)
-				end)
-			)
-		end
-	end
-	table.insert(
-		s.connections,
-		ScriptEditorService.TextDocumentDidChange:Connect(function(document)
-			local ok, script = pcall(function()
-				return document:GetScript()
-			end)
-			if ok and script and inRoots(s, script) then
-				s.dirtySource[script] = os.clock()
-			end
-		end)
-	)
-end
-
--- -- full sync ---------------------------------------------------------------------
 
 local function serializeBase64(instance: Instance): string
 	local blob = SerializationService:SerializeInstancesAsync({ instance })
@@ -666,6 +474,217 @@ local function backup(s, items: { any }): string?
 	return dir
 end
 
+-- -- disk -> Studio ------------------------------------------------------------
+
+type Counts = { created: number, updated: number, removed: number }
+
+local function loadModel(s, node: any): Instance
+	local status, body = request(s, "GET", `/model?file={HttpService:UrlEncode(node.model)}`)
+	if status ~= 200 then
+		error(`{node.model}: daemon answered {status}: {body}`)
+	end
+	local blob = EncodingService:Base64Decode(buffer.fromstring(body))
+	local instances = SerializationService:DeserializeInstancesAsync(blob)
+	assert(#instances == 1, `{node.model} holds {#instances} root instances; a model file needs exactly one`)
+	return instances[1]
+end
+
+-- Studio can save the model over its file (an XML .rbxmx or a read-only one it can't).
+local function saveable(s, node: any): boolean
+	return s.writeback and node.ro ~= true and string.sub(node.model or "", -5) == ".rbxm"
+end
+
+-- Studio is the source of truth for a model it can save: a full sync keeps Studio's instance
+-- (`kept` collects them, to save over their files), and a file change waits while Studio has
+-- an unsaved edit. Otherwise the file is loaded. Returns the instance and the node to remember.
+local function applyModel(s, node: any, counts: Counts, kept: { string }?): (Instance?, any)
+	local key = keyOf(node.path)
+	local existing = find(node.path)
+	local previous = s.known[key]
+	if
+		existing
+		and (s.adopt[key] or (previous and previous.instance == existing and previous.modelHash == node.modelHash))
+	then
+		s.adopt[key] = nil
+		return existing, node
+	end
+	if existing and saveable(s, node) then
+		if kept then
+			table.insert(kept, key)
+			return existing, node
+		elseif s.dirtyModels[key] and previous and previous.instance == existing then
+			-- the pending save carries the hash Studio loaded, so the daemon backs up the new file
+			local effective = table.clone(node)
+			effective.modelHash = previous.modelHash
+			return existing, effective
+		end
+	end
+	local parentPath = table.clone(node.path)
+	table.remove(parentPath)
+	local parent = if #parentPath == 1 then getService(parentPath[1]) else resolve(parentPath, "Folder")
+	assert(parent, `no parent for {display(node.path)}`)
+	local loaded = loadModel(s, node)
+	loaded.Name = node.path[#node.path]
+	if existing then
+		unhook(s, key) -- its removal is no edit to save
+		existing:Destroy()
+		counts.removed += 1
+	end
+	loaded.Parent = parent
+	counts.created += 1
+	return loaded, node
+end
+
+-- Returns the instance and the node to remember.
+local function applyNode(s, node: any, counts: Counts, errors: { string }, kept: { string }?): (Instance?, any)
+	if node.error then
+		table.insert(errors, node.error)
+	end
+	if node.kind == "model" then
+		return applyModel(s, node, counts, kept)
+	end
+	local instance, created = resolve(node.path, node.className)
+	if not instance then
+		table.insert(errors, `{display(node.path)}: no service {node.path[1]}`)
+		return nil, node
+	end
+	if created then
+		counts.created += 1
+	end
+	if node.source and isScript(instance) and setSource(instance, node.source) then
+		counts.updated += 1
+	end
+	if node.runContext and (instance :: any).RunContext ~= Enum.RunContext[node.runContext] then
+		(instance :: any).RunContext = Enum.RunContext[node.runContext]
+	end
+	if node.properties then
+		setProperties(instance, node.properties, errors)
+	end
+	if node.attributes then
+		for name, value in node.attributes do
+			local ok, err = pcall(instance.SetAttribute, instance, name, decodeAttribute(value))
+			if not ok then
+				table.insert(errors, `{instance:GetFullName()} attribute {name}: {err}`)
+			end
+		end
+	end
+	return instance, node
+end
+
+local function byDepth(a: any, b: any): boolean
+	return #a.path < #b.path
+end
+
+local function send(s, message: any)
+	local socket = s.socket
+	if socket then
+		pcall(socket.Send, socket, HttpService:JSONEncode(message))
+	end
+end
+
+local function sendReport(s)
+	send(s, { type = "report", errors = s.errors })
+end
+
+local function report(s, errors: { string })
+	if #errors == 0 and #s.errors == 0 then
+		return
+	end
+	s.errors = errors
+	for _, err in errors do
+		s.log(`[studio-sync] {err}`)
+	end
+	sendReport(s)
+end
+
+local function summary(counts: Counts): string
+	return `created {counts.created}, updated {counts.updated}, removed {counts.removed}`
+end
+
+-- -- Studio -> disk: watching ----------------------------------------------------
+
+local saveModel, saveModels
+
+local function modelEdited(s, key: string)
+	s.dirtyModels[key] = os.clock()
+	if not s.saveScheduled then
+		s.saveScheduled = true
+		task.delay(MODEL_DEBOUNCE, saveModels, s)
+	end
+end
+
+-- Watches a synced model's instances: an edit saves the model once Studio is quiet.
+function hookModel(s, key: string, model: Instance)
+	local current = s.modelHooks[key]
+	if current and current.instance == model then
+		return
+	end
+	unhook(s, key)
+	local list = {}
+	local hooks = { instance = model, list = list, armed = false }
+	local function edited()
+		if hooks.armed then
+			modelEdited(s, key)
+		end
+	end
+	local function watchOne(instance: Instance)
+		table.insert(list, instance.Changed:Connect(edited))
+		table.insert(list, instance.AttributeChanged:Connect(edited))
+	end
+	watchOne(model)
+	for _, descendant in model:GetDescendants() do
+		watchOne(descendant)
+	end
+	table.insert(
+		list,
+		model.DescendantAdded:Connect(function(descendant)
+			watchOne(descendant)
+			edited()
+		end)
+	)
+	table.insert(list, model.DescendantRemoving:Connect(edited))
+	s.modelHooks[key] = hooks
+	-- events are deferred: the loader's own Name and Parent changes arrive after this returns
+	task.spawn(function()
+		task.wait()
+		hooks.armed = true
+	end)
+end
+
+local function unhookAll(s)
+	for key in s.modelHooks do
+		unhook(s, key)
+	end
+	for _, connection in s.connections do
+		connection:Disconnect()
+	end
+	s.connections = {}
+end
+
+-- Scripts sync one way: an edit in Studio's editor gets a warning, once per script.
+local function watchEditor(s)
+	for _, connection in s.connections do
+		connection:Disconnect()
+	end
+	s.connections = {
+		ScriptEditorService.TextDocumentDidChange:Connect(function(document)
+			local ok, script = pcall(function()
+				return document:GetScript()
+			end)
+			local key = ok and script and s.byInstance[script]
+			if key then
+				warnOnce(
+					s,
+					"edit" .. key,
+					`{display(s.known[key].path)}: Studio edits to synced scripts are not saved; edit its file (the next disk change replaces it)`
+				)
+			end
+		end),
+	}
+end
+
+-- -- full sync ---------------------------------------------------------------------
+
 local function applyFull(s, data: any): (Counts, { string })
 	local counts = { created = 0, updated = 0, removed = 0 }
 	local errors = {}
@@ -686,10 +705,19 @@ local function applyFull(s, data: any): (Counts, { string })
 		end
 	end
 
-	s.known, s.byInstance, s.dirtySource, s.rejected, s.structureAt = {}, {}, {}, {}, nil
+	-- a model that is still what was loaded stays (applyModel compares the previous entries)
+	local previous = s.known
+	s.writeback = data.writeback and s.writebackEnabled
+	s.known, s.byInstance = {}, {}
+	for key, entry in previous do
+		if entry.kind == "model" then
+			s.known[key] = entry
+		end
+	end
 	local wanted: { [Instance]: boolean } = {}
+	local kept = {}
 	for _, node in nodes do
-		local ok, result, effective = pcall(applyNode, s, node, counts, errors)
+		local ok, result, effective = pcall(applyNode, s, node, counts, errors, kept)
 		if not ok then
 			table.insert(errors, `{display(node.path)}: {result}`)
 		elseif result then
@@ -741,9 +769,25 @@ local function applyFull(s, data: any): (Counts, { string })
 		end
 	end
 
+	-- models no longer on disk
+	for key, entry in s.known do
+		if not wanted[entry.instance] then
+			s.known[key] = nil
+			unhook(s, key)
+		end
+	end
+	-- Studio's models win: each is saved over its file (the daemon writes only a difference)
+	s.saving = true
+	for _, key in kept do
+		s.dirtyModels[key] = nil
+		local ok, err = pcall(saveModel, s, key, "")
+		if not ok then
+			table.insert(errors, `{display(string.split(key, SEP))}: not saved: {err}`)
+		end
+	end
+	s.saving = false
 	s.epoch, s.version, s.roots, s.name = data.epoch, data.version, data.roots, data.name
-	s.writeback = data.writeback and s.writebackEnabled
-	watch(s)
+	watchEditor(s)
 	return counts, errors
 end
 
@@ -753,20 +797,38 @@ local function applyDelta(s, data: any): (Counts, { string })
 	for _, path in data.removes do
 		local entry = s.known[keyOf(path)]
 		local instance = if entry and entry.instance.Parent then entry.instance else find(path)
+		forget(s, path) -- first: a watched model's removal is no edit to save
 		if instance and instance.Parent and pathOf(instance) and keyOf(pathOf(instance) :: any) == keyOf(path) then
 			instance:Destroy()
 			counts.removed += 1
 		end
-		forget(s, path)
 	end
 	table.sort(data.upserts, byDepth)
+	-- Studio text that was edited since the last sync is backed up before disk replaces it
+	local items = {}
+	for _, node in data.upserts do
+		local entry = node.source and s.known[keyOf(node.path)]
+		if entry and entry.source and entry.instance.Parent and isScript(entry.instance) then
+			local text = currentText(entry.instance)
+			if text ~= entry.source and text ~= node.source then
+				table.insert(items, { path = node.path, source = text })
+			end
+		end
+	end
+	if #items > 0 then
+		s.log(
+			`[studio-sync] {#items} script(s) edited in Studio were replaced from disk; Studio's text saved in {backup(
+				s,
+				items
+			)}`
+		)
+	end
 	for _, node in data.upserts do
 		local ok, result, effective = pcall(applyNode, s, node, counts, errors)
 		if not ok then
 			table.insert(errors, `{display(node.path)}: {result}`)
 		elseif result then
 			remember(s, effective, result)
-			hook(s, result)
 		end
 	end
 	s.version = data.version
@@ -774,236 +836,6 @@ local function applyDelta(s, data: any): (Counts, { string })
 		s.writeback = data.writeback and s.writebackEnabled
 	end
 	return counts, errors
-end
-
--- -- Studio -> disk: writeback -------------------------------------------------------
-
--- Compares the roots with `known`: new scripts and folders, renames and moves, deletions.
-local function scan(s): ({ any }, { any })
-	local ops, effects = {}, {}
-	local seen: { [Instance]: boolean } = {}
-	local unsaved = {}
-
-	local function visit(instance: Instance, parentPath: { string }?, moved: boolean, opaque: boolean)
-		local path = if parentPath then table.clone(parentPath) else pathOf(instance) :: { string }
-		if parentPath then
-			table.insert(path, instance.Name)
-		end
-		local key = keyOf(path)
-		local oldKey = s.byInstance[instance]
-		local entry = oldKey and s.known[oldKey]
-		if entry then
-			seen[instance] = true
-			if oldKey ~= key and not moved then
-				if structural(entry) and not s.rejected[instance] then
-					table.insert(ops, { op = "move", from = entry.path, to = path })
-					table.insert(effects, { kind = "move", from = entry.path, to = path, instance = instance })
-					moved = true
-				else
-					warnOnce(
-						s,
-						"move" .. key,
-						`{display(path)} was renamed or moved in Studio only ({entry.kind} content: change its file)`
-					)
-				end
-			end
-			opaque = entry.kind == "model" or entry.kind == "json" or entry.kind == "generated"
-		elseif opaque or s.rejected[instance] then
-			return
-		elseif isScript(instance) or instance.ClassName == "Folder" then
-			local op = { op = "create", path = path, className = instance.ClassName }
-			if isScript(instance) then
-				op.source = currentText(instance)
-				op.runContext = if instance:IsA("Script") then (instance :: any).RunContext.Name else nil
-			end
-			table.insert(ops, op)
-			table.insert(effects, { kind = "create", path = path, instance = instance, op = op })
-			moved = true -- its children are new too, not moved
-		else
-			table.insert(unsaved, display(path))
-			return
-		end
-		for _, child in instance:GetChildren() do
-			visit(child, path, moved, opaque)
-		end
-	end
-
-	for _, root in s.rootInstances do
-		if root.Parent then
-			visit(root, nil, false, false)
-		end
-	end
-
-	-- known entries no longer under the roots were deleted (or moved out)
-	local deleted = {}
-	for key, entry in s.known do
-		if not seen[entry.instance] and not entry.gone then
-			if structural(entry) then
-				deleted[key] = entry
-			else
-				entry.gone = true
-				local parentPath = table.clone(entry.path)
-				table.remove(parentPath)
-				local parent = s.known[keyOf(parentPath)]
-				if parent and not seen[parent.instance] then
-					continue -- its parent's removal covers it
-				end
-				s.log(
-					`[studio-sync] {display(entry.path)} was removed in Studio only ({entry.kind} content: delete its file to remove it)`
-				)
-			end
-		end
-	end
-	for key, entry in deleted do
-		local parentPath = table.clone(entry.path)
-		table.remove(parentPath)
-		if not deleted[keyOf(parentPath)] then
-			table.insert(ops, 1, { op = "delete", path = entry.path })
-			table.insert(effects, 1, { kind = "delete", path = entry.path, entry = entry })
-		end
-	end
-	s.unsaved = unsaved
-	return ops, effects
-end
-
-local function sourceOps(s, ops: { any }, effects: { any }, force: boolean?)
-	local now = os.clock()
-	for instance, at in s.dirtySource do
-		if not force and now - at < SOURCE_DEBOUNCE then
-			continue
-		end
-		local key = s.byInstance[instance]
-		local entry = key and s.known[key]
-		local path = pathOf(instance)
-		if not entry or not path then
-			s.dirtySource[instance] = nil -- new or gone: the scan handles it
-			continue
-		end
-		if keyOf(path) ~= key then
-			if not s.structureAt then
-				s.dirtySource[instance] = nil
-			end
-			continue -- wait for the move first
-		end
-		s.dirtySource[instance] = nil
-		local text = currentText(instance)
-		if text == entry.source then
-			continue
-		end
-		if entry.ro or (entry.kind ~= "script" and entry.kind ~= "init") then
-			warnOnce(s, "ro" .. key, `{display(entry.path)} is read-only here ({entry.kind}); edit its file instead`)
-			continue
-		end
-		table.insert(ops, { op = "source", path = entry.path, source = text, base = entry.sourceHash })
-		table.insert(effects, { kind = "source", entry = entry, instance = instance, text = text })
-	end
-end
-
-local function settle(s, effect: any, result: any)
-	if effect.kind == "source" then
-		if result.ok then
-			effect.entry.source = effect.text
-			effect.entry.sourceHash = result.sourceHash
-		elseif result.conflict then
-			effect.entry.source = result.conflict.source
-			effect.entry.sourceHash = result.conflict.sourceHash
-			setSource(effect.instance, result.conflict.source)
-			s.log(
-				`[studio-sync] CONFLICT {display(effect.entry.path)}: changed on disk and in Studio. Kept disk; Studio's text saved to {result.conflict.saved}`
-			)
-		else
-			s.log(`[studio-sync] {display(effect.entry.path)} not saved: {result.error}`)
-		end
-	elseif effect.kind == "create" then
-		if result.ok then
-			remember(s, {
-				path = effect.path,
-				className = effect.op.className,
-				kind = if effect.op.className == "Folder" then "dir" else "script",
-				source = effect.op.source,
-				sourceHash = result.sourceHash,
-			}, effect.instance)
-			s.log(`[studio-sync] saved new {effect.op.className} {display(effect.path)}`)
-		else
-			s.rejected[effect.instance] = true
-			s.log(`[studio-sync] {display(effect.path)} stays in Studio only: {result.error}`)
-		end
-	elseif effect.kind == "move" then
-		if result.ok then
-			rekey(s, effect.from, effect.to)
-			s.log(`[studio-sync] moved {display(effect.from)} -> {display(effect.to)}`)
-		else
-			s.rejected[effect.instance] = true
-			s.log(`[studio-sync] {display(effect.to)}: rename not saved: {result.error}`)
-		end
-	elseif effect.kind == "delete" then
-		if result.ok then
-			forget(s, effect.path)
-			s.log(`[studio-sync] deleted {display(effect.path)} (the daemon keeps a copy)`)
-		else
-			effect.entry.gone = true
-			s.log(`[studio-sync] {display(effect.path)} deleted in Studio only: {result.error}`)
-		end
-	end
-end
-
-local flushNow
-
--- Sends what changed in Studio. Returns how many edits were sent.
-function Sync.flush(s, force: boolean?): number
-	if not s.writeback or s.status ~= "connected" then
-		return 0
-	end
-	-- one flush at a time: a second one would resend edits still in flight
-	while s.flushing do
-		if not force then
-			return 0
-		end
-		task.wait()
-	end
-	s.flushing = true
-	local ok, result = pcall(flushNow, s, force)
-	s.flushing = false
-	if not ok then
-		error(result, 0)
-	end
-	return result
-end
-
-function flushNow(s, force: boolean?): number
-	local ops, effects = {}, {}
-	if s.structureAt and (force or os.clock() - s.structureAt >= STRUCTURE_DEBOUNCE) then
-		s.structureAt = nil
-		ops, effects = scan(s)
-		report(s, {})
-	end
-	sourceOps(s, ops, effects, force)
-	local start = 1
-	while start <= #ops do
-		-- batches under the post limit, in order
-		local batch, batchEffects, size = {}, {}, 0
-		local index = start
-		while index <= #ops do
-			local opSize = #(ops[index].source or "") + 300
-			if #batch > 0 and size + opSize > POST_LIMIT then
-				break
-			end
-			table.insert(batch, ops[index])
-			table.insert(batchEffects, effects[index])
-			size += opSize
-			index += 1
-		end
-		if size > POST_LIMIT then
-			s.log(`[studio-sync] {display(batch[1].path or batch[1].to)} is over 900 KB; not saved (edit it on disk)`)
-		else
-			local response = postJson(s, "/writeback", { ops = batch })
-			for i, result in response.results do
-				settle(s, batchEffects[i], result)
-			end
-		end
-		start = index
-	end
-	return #ops
 end
 
 -- -- pull: save any instance as a model file -------------------------------------------
@@ -1038,7 +870,6 @@ function Sync.pull(s, instance: Instance, file: string?, id: string?): (boolean,
 	local result = HttpService:JSONDecode(body)
 	if result.ok then
 		s.adopt[keyOf(path)] = true
-		s.rejected[instance] = nil
 		return true, result.file
 	end
 	return false, result.error
@@ -1055,8 +886,6 @@ local UNSAVED_TYPES =
 	{ RefType = true, SecurityCapabilities = true, SharedString = true, OptionalCoordinateFrame = true }
 -- Instances Studio makes for the session, never part of the place
 local SESSION_CLASSES = { Player = true, Camera = true }
--- Attributes studio-sync itself puts on the place
-local OWN_ATTRIBUTES = { StudioSyncSession = true }
 
 -- A property value in Rojo's explicit form, or nil when Rojo can't express it.
 local function encodeValue(engineType: string, value: any): any
@@ -1143,14 +972,12 @@ local function serviceSettings(service: Instance, skipped: { string }): (any, an
 	local attributes = {}
 	local attributeCount = 0
 	for name, value in service:GetAttributes() do
-		if not OWN_ATTRIBUTES[name] then
-			local encoded = encodeValue(if type(value) == "number" then "double" else "", value)
-			if encoded then
-				attributes[name] = encoded
-				attributeCount += 1
-			else
-				table.insert(skipped, `{service.Name} attribute {name} ({typeof(value)})`)
-			end
+		local encoded = encodeValue(if type(value) == "number" then "double" else "", value)
+		if encoded then
+			attributes[name] = encoded
+			attributeCount += 1
+		else
+			table.insert(skipped, `{service.Name} attribute {name} ({typeof(value)})`)
 		end
 	end
 	return if count > 0 then properties else nil, if attributeCount > 0 then attributes else nil
@@ -1175,6 +1002,72 @@ local function upload(s, route: string, encoded: string): (number, string)
 		end
 	end
 	return status, body
+end
+
+-- -- model saves ---------------------------------------------------------------------
+
+-- Saves one synced model over its file; the answer's hash keeps the next delta from reloading it.
+-- `base` is the file Studio's version comes from: the daemon backs up a file that is not it.
+-- A full sync passes "", since Studio's instance did not come from the file as it is now.
+function saveModel(s, key: string, base: string?)
+	local entry = s.known[key]
+	if not (entry and entry.kind == "model" and entry.instance.Parent) then
+		return
+	end
+	local path = HttpService:UrlEncode(HttpService:JSONEncode(entry.path))
+	local route = `/save?upload={HttpService:GenerateGUID(false)}&base={base or entry.modelHash}&path={path}`
+	local status, body = upload(s, route, serializeBase64(entry.instance))
+	if status ~= 200 then
+		error(`daemon answered {status}: {body}`)
+	end
+	local result = HttpService:JSONDecode(body)
+	if result.ok then
+		if result.replaced then
+			s.log(
+				`[studio-sync] {display(entry.path)}: Studio's version replaced its file (the file is in {result.replaced})`
+			)
+		elseif result.modelHash ~= entry.modelHash then
+			s.log(`[studio-sync] saved {display(entry.path)}`)
+		end
+		entry.modelHash = result.modelHash
+	else
+		warnOnce(s, "save" .. key .. tostring(result.error), `{display(entry.path)} not saved: {result.error}`)
+	end
+end
+
+-- Saves the models that have been quiet for MODEL_DEBOUNCE, one at a time.
+function saveModels(s)
+	s.saveScheduled = false
+	if s.saving then
+		s.saveScheduled = true
+		task.delay(MODEL_DEBOUNCE, saveModels, s)
+		return
+	end
+	local now, soonest = os.clock(), nil
+	local due = {}
+	for key, at in s.dirtyModels do
+		local left = MODEL_DEBOUNCE - (now - at)
+		if left > 0 then
+			soonest = math.min(soonest or left, left)
+		else
+			table.insert(due, key)
+		end
+	end
+	if #due > 0 and s.writeback and s.status == "connected" and not s.paused then
+		s.saving = true
+		for _, key in due do
+			s.dirtyModels[key] = nil
+			local ok, err = pcall(saveModel, s, key)
+			if not ok then
+				warnOnce(s, "save" .. tostring(err), `saving {display(string.split(key, SEP))} failed: {err}`)
+			end
+		end
+		s.saving = false
+	end
+	if soonest and not s.saveScheduled then
+		s.saveScheduled = true
+		task.delay(soonest, saveModels, s)
+	end
 end
 
 -- Saves everything in the place that the project's files don't already own: each
@@ -1265,40 +1158,117 @@ local function fail(s, id: string, message: string)
 	pcall(request, s, "POST", `/command/result?id={id}&error={HttpService:UrlEncode(message)}`, "")
 end
 
-local function runCommands(s, commands: { any }?)
-	for _, command in commands or {} do
-		if command.kind == "snapshot" then
-			task.spawn(function()
-				local ok, saved, message = pcall(Sync.snapshot, s, command.id)
-				if ok and saved then
-					s.log(`[studio-sync] snapshot: {message}`)
-				else
-					local reason = tostring(if ok then message else saved)
-					fail(s, command.id, reason)
-					s.log(`[studio-sync] snapshot failed: {reason}`)
-				end
-			end)
-		elseif command.kind == "pull" then
-			task.spawn(function()
-				local instance = find(command.path)
-				if not instance then
-					pcall(
-						request,
-						s,
-						"POST",
-						`/pull?id={command.id}&error={HttpService:UrlEncode("no instance at " .. display(command.path))}`,
-						""
-					)
-					return
-				end
-				local ok, message = Sync.pull(s, instance, command.file, command.id)
-				s.log(`[studio-sync] pull {display(command.path)}: {message}`)
-				if not ok then
-					pcall(request, s, "POST", `/pull?id={command.id}&error={HttpService:UrlEncode(message)}`, "")
-				end
-			end)
+local function runCommand(s, command: any)
+	if command.type == "snapshot" then
+		local ok, saved, message = pcall(Sync.snapshot, s, command.id)
+		if ok and saved then
+			s.log(`[studio-sync] snapshot: {message}`)
+		else
+			local reason = tostring(if ok then message else saved)
+			fail(s, command.id, reason)
+			s.log(`[studio-sync] snapshot failed: {reason}`)
+		end
+	elseif command.type == "pull" then
+		local instance = find(command.path)
+		if not instance then
+			local message = HttpService:UrlEncode("no instance at " .. display(command.path))
+			pcall(request, s, "POST", `/pull?id={command.id}&error={message}`, "")
+			return
+		end
+		local ok, message = Sync.pull(s, instance, command.file, command.id)
+		s.log(`[studio-sync] pull {display(command.path)}: {message}`)
+		if not ok then
+			pcall(request, s, "POST", `/pull?id={command.id}&error={HttpService:UrlEncode(message)}`, "")
 		end
 	end
+end
+
+-- -- the socket --------------------------------------------------------------------
+
+-- Wakes the loop: a new version, or the socket closed.
+local function ring(s)
+	s.rung = true
+	local waiting = s.waiting
+	if waiting then
+		s.waiting = nil
+		task.spawn(waiting)
+	end
+end
+
+local function waitForRing(s)
+	if not s.rung then
+		s.waiting = coroutine.running()
+		coroutine.yield()
+	end
+	s.rung = false
+end
+
+local function closeSocket(s)
+	local socket = s.socket
+	s.socket = nil
+	if socket then
+		pcall(socket.Close, socket)
+	end
+	ring(s)
+end
+
+local function onMessage(s, text: string)
+	local ok, message = pcall(HttpService.JSONDecode, HttpService, text)
+	if not ok or type(message) ~= "table" then
+		return
+	end
+	if message.type == "version" then
+		s.latest = message
+		ring(s)
+	elseif message.type == "snapshot" or message.type == "pull" then
+		task.spawn(runCommand, s, message)
+	end
+end
+
+-- Opens the socket after a full sync; the daemon counts this Studio as connected while it is open.
+local function openSocket(s): boolean
+	closeSocket(s)
+	local ok, socket = pcall(function()
+		return HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, {
+			Url = socketUrl(s, `/socket?epoch={s.epoch}&version={s.version}`),
+		})
+	end)
+	if not ok then
+		warnOnce(s, "socket" .. tostring(socket), `no WebSocket: {socket}`)
+		return false
+	end
+	local state = nil -- "open" | "failed"
+	socket.Opened:Connect(function()
+		state = state or "open"
+	end)
+	-- a failure is followed by Closed, which the loop reports as a disconnect
+	socket.Error:Connect(function()
+		state = state or "failed"
+	end)
+	socket.Closed:Connect(function()
+		state = state or "failed"
+		if s.socket == socket then
+			s.socket = nil
+			ring(s)
+		end
+	end)
+	socket.MessageReceived:Connect(function(text: string)
+		if s.socket == socket then
+			onMessage(s, text)
+		end
+	end)
+	local deadline = os.clock() + 10
+	while state == nil and os.clock() < deadline do
+		task.wait(0.05)
+	end
+	if state ~= "open" then
+		pcall(socket.Close, socket)
+		return false
+	end
+	s.socket = socket
+	s.latest = { epoch = s.epoch, version = s.version }
+	sendReport(s)
+	return true
 end
 
 -- -- the loop ----------------------------------------------------------------------
@@ -1323,10 +1293,10 @@ function Sync.connect(s): (string?, string?)
 	return summary(counts)
 end
 
--- Waits for (and applies) the next change; returns its summary, "" when none came,
+-- Applies the changes since the last sync; returns their summary, "" when there were none,
 -- or nil when a full resync is needed.
-function Sync.poll(s, wait: number?): string?
-	local status, body = request(s, "GET", `/changes?epoch={s.epoch}&since={s.version}&wait={wait or 20}`)
+function Sync.poll(s): string?
+	local status, body = request(s, "GET", `/changes?epoch={s.epoch}&since={s.version}`)
 	if status ~= 200 then
 		error(`daemon answered {status}: {body}`)
 	end
@@ -1334,17 +1304,19 @@ function Sync.poll(s, wait: number?): string?
 		return "" -- resuming does a full sync
 	end
 	local data = HttpService:JSONDecode(body)
-	runCommands(s, data.commands)
 	if data.full then
 		return nil
 	end
 	if data.version == s.version then
 		return ""
 	end
-	-- local edits go first, so a delta can't overwrite text that was never saved
-	Sync.flush(s, true)
+	-- a model save in flight answers first, so the delta knows the model's new hash
+	while s.saving do
+		task.wait()
+	end
 	local counts, errors = applyDelta(s, data)
 	report(s, errors)
+	send(s, { type = "applied", version = s.version })
 	return summary(counts)
 end
 
@@ -1352,17 +1324,22 @@ function Sync.setPaused(s, paused: boolean)
 	s.paused = paused
 	if paused then
 		setStatus(s, "paused")
+		closeSocket(s)
 	end
 end
 
 function Sync.stop(s)
 	s.stopped = true
 	unhookAll(s)
+	closeSocket(s)
 end
 
 local function cycle(s)
 	if s.status ~= "connected" then
 		local line, reason = Sync.connect(s)
+		if line and not openSocket(s) then
+			line, reason = nil, "offline"
+		end
 		if not line then
 			if reason ~= "offline" and reason ~= "unknown place" then
 				warnOnce(s, "connect" .. tostring(reason), tostring(reason))
@@ -1372,34 +1349,39 @@ local function cycle(s)
 			return
 		end
 		setStatus(s, "connected")
-		local mode = if s.writeback then "two-way" else "disk -> Studio only"
+		local mode = if s.writeback then "models save back" else "disk -> Studio only"
 		s.log(`[studio-sync] connected: {s.name} v{s.version}, {mode} ({line})`)
+		return
+	end
+	waitForRing(s)
+	if s.stopped or s.paused then
+		return
+	end
+	if not s.socket then
+		error("the daemon closed the connection")
+	end
+	local latest = s.latest
+	if latest.epoch == s.epoch and latest.version <= s.version then
 		return
 	end
 	local line = Sync.poll(s)
 	if line == nil then
 		local resync = Sync.connect(s)
 		if resync then
+			send(s, { type = "applied", version = s.version })
 			s.log(`[studio-sync] resynced v{s.version} ({resync})`)
 		end
 	elseif line ~= "" then
 		s.log(`[studio-sync] v{s.version}: {line}`)
 	end
+	-- a version that came while this one applied
+	if s.latest.epoch ~= s.epoch or s.latest.version > s.version then
+		ring(s)
+	end
 end
 
 -- The blocking loops: call from task.spawn. Quiet while the daemon is down.
 function Sync.run(s)
-	task.spawn(function()
-		while not s.stopped do
-			task.wait(0.25)
-			if not s.paused and s.status == "connected" then
-				local ok, err = pcall(Sync.flush, s)
-				if not ok then
-					warnOnce(s, "flush" .. tostring(err), `writeback failed: {err}`)
-				end
-			end
-		end
-	end)
 	while not s.stopped do
 		if s.paused then
 			task.wait(0.5)
@@ -1409,6 +1391,7 @@ function Sync.run(s)
 				if s.status == "connected" then
 					s.log(`[studio-sync] disconnected ({err})`)
 				end
+				closeSocket(s)
 				setStatus(s, "offline")
 				task.wait(RETRY_OFFLINE)
 			end

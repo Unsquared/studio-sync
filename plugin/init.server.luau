@@ -19,7 +19,7 @@ local syncButton = toolbar:CreateButton(
 syncButton.ClickableWhenViewportHidden = true
 local saveButton = toolbar:CreateButton(
 	"StudioSyncSave",
-	"Save the selected instances (models, parts, values...) into the repo as .rbxm. Scripts and folders save by themselves.",
+	"Save the selected instances (models, parts, values...) into the repo as .rbxm. After that, Studio edits to them save by themselves.",
 	"",
 	"Save to disk"
 )
@@ -36,9 +36,9 @@ state = Sync.start({
 syncButton.Click:Connect(function()
 	Sync.setPaused(state, not state.paused)
 	if state.paused then
-		print("[studio-sync] paused: Studio edits are not saved and disk changes not applied")
+		print("[studio-sync] paused: model edits are not saved and disk changes not applied")
 	else
-		print("[studio-sync] resumed: syncing Studio to disk again")
+		print("[studio-sync] resumed: syncing again")
 		state.status = "offline"
 	end
 	syncButton:SetActive(false)

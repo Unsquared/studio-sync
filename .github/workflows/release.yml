@@ -1,0 +1,57 @@
+# On a version tag (v3.0.0): build the binary for each platform and attach it to a GitHub
+# release, named the way rokit finds it (`rokit add --global Unsquared/studio-sync`).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the tag against Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version"; exit 1; }
+      - run: gh release create "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: create
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos-aarch64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            platform: macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Upload
+        shell: bash
+        run: |
+          exe=studio-sync
+          [ "$RUNNER_OS" = Windows ] && exe=studio-sync.exe
+          archive="studio-sync-${GITHUB_REF_NAME#v}-${{ matrix.platform }}.zip"
+          cd "target/${{ matrix.target }}/release"
+          if [ "$RUNNER_OS" = Windows ]; then 7z a "$archive" "$exe"; else zip "$archive" "$exe"; fi
+          gh release upload "$GITHUB_REF_NAME" "$archive"
+        env:
+          GH_TOKEN: ${{ github.token }}
