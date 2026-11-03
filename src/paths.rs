@@ -27,6 +27,11 @@ pub fn projects_file() -> PathBuf {
 	STATE_DIR.join("projects.json")
 }
 
+// The version of each model Studio and its file last agreed on (writeback.rs)
+pub fn agreed_file(project: &str) -> PathBuf {
+	STATE_DIR.join("agreed").join(format!("{project}.json"))
+}
+
 pub fn staging_root() -> PathBuf {
 	STATE_DIR.join("staging")
 }

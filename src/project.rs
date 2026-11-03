@@ -135,6 +135,8 @@ enum ClientMessage {
 #[derive(Default)]
 pub struct State {
 	pub config: Config,
+	// read from disk when a model save first needs it
+	pub agreed: Option<crate::writeback::Agreed>,
 	pub epoch: String,
 	pub version: u64,
 	log_base: u64,

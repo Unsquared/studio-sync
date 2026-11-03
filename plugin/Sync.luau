@@ -6,12 +6,12 @@
 	  new version is out; then reads /changes and applies the delta (creates,
 	  deletes, moves, Source, properties, attributes, .rbxm models);
 	- Studio -> disk: models only. A synced .rbxm model edited in Studio is saved
-	  over its file once Studio is quiet (/save). Studio is the source of truth
-	  for models: a connect saves Studio's models over their files, and a file
-	  change waits while Studio has an unsaved edit; a file Studio replaces goes
-	  to the daemon's backups. A file change with no edit pending loads in
-	  Studio (a git pull). Scripts are edited on disk: a Studio edit is not
-	  saved, and the next disk change replaces it.
+	  over its file once Studio is quiet (/save). On a connect, the daemon
+	  compares each model with the version Studio and its file last agreed on:
+	  the side that changed wins, and Studio when both did (the file goes to
+	  backups). While connected, a file change loads in Studio unless Studio
+	  has an unsaved edit of that model. Scripts are edited on disk: a Studio
+	  edit is not saved, and the next disk change replaces it.
 
 	Other instances (Parts, models, values) made in Studio are saved with
 	Sync.pull (the toolbar's "Save to disk", or `studio-sync pull` from a shell);
@@ -31,7 +31,7 @@ local HttpService = game:GetService("HttpService")
 local ScriptEditorService = game:GetService("ScriptEditorService")
 local SerializationService = game:GetService("SerializationService")
 
-local PLUGIN_VERSION = "3.0.0"
+local PLUGIN_VERSION = "3.1.0"
 local DEFAULT_URL = "http://localhost:34999"
 local RETRY_OFFLINE = 3
 local RETRY_UNKNOWN = 6
@@ -102,6 +102,7 @@ function Sync.new(options: { [string]: any })
 		dirtyModels = {}, -- key -> os.clock() of the model's last edit
 		saveScheduled = false,
 		saving = false, -- a model save is in flight
+		loaded = {}, -- key -> true: models loaded from their files, whose Studio version is not recorded yet
 		connections = {},
 		warned = {},
 		errors = {},
@@ -424,6 +425,7 @@ local function remember(s, node: any, instance: Instance)
 		source = node.source,
 		sourceHash = node.sourceHash,
 		modelHash = node.modelHash,
+		model = node.model,
 		instance = instance,
 	}
 	s.byInstance[instance] = key
@@ -489,14 +491,34 @@ local function loadModel(s, node: any): Instance
 	return instances[1]
 end
 
+-- Loads a model's file in place of `existing`.
+local function loadInto(s, node: any, existing: Instance?, counts: Counts): Instance
+	local key = keyOf(node.path)
+	local parentPath = table.clone(node.path)
+	table.remove(parentPath)
+	local parent = if #parentPath == 1 then getService(parentPath[1]) else resolve(parentPath, "Folder")
+	assert(parent, `no parent for {display(node.path)}`)
+	local loaded = loadModel(s, node)
+	loaded.Name = node.path[#node.path]
+	if existing then
+		unhook(s, key) -- its removal is no edit to save
+		existing:Destroy()
+		counts.removed += 1
+	end
+	loaded.Parent = parent
+	counts.created += 1
+	s.loaded[key] = true
+	return loaded
+end
+
 -- Studio can save the model over its file (an XML .rbxmx or a read-only one it can't).
 local function saveable(s, node: any): boolean
 	return s.writeback and node.ro ~= true and string.sub(node.model or "", -5) == ".rbxm"
 end
 
--- Studio is the source of truth for a model it can save: a full sync keeps Studio's instance
--- (`kept` collects them, to save over their files), and a file change waits while Studio has
--- an unsaved edit. Otherwise the file is loaded. Returns the instance and the node to remember.
+-- A model Studio can save: a full sync keeps Studio's instance (`kept` collects them; the daemon
+-- then says which side wins), and a file change waits while Studio has an unsaved edit.
+-- Otherwise the file is loaded. Returns the instance and the node to remember.
 local function applyModel(s, node: any, counts: Counts, kept: { string }?): (Instance?, any)
 	local key = keyOf(node.path)
 	local existing = find(node.path)
@@ -519,20 +541,7 @@ local function applyModel(s, node: any, counts: Counts, kept: { string }?): (Ins
 			return existing, effective
 		end
 	end
-	local parentPath = table.clone(node.path)
-	table.remove(parentPath)
-	local parent = if #parentPath == 1 then getService(parentPath[1]) else resolve(parentPath, "Folder")
-	assert(parent, `no parent for {display(node.path)}`)
-	local loaded = loadModel(s, node)
-	loaded.Name = node.path[#node.path]
-	if existing then
-		unhook(s, key) -- its removal is no edit to save
-		existing:Destroy()
-		counts.removed += 1
-	end
-	loaded.Parent = parent
-	counts.created += 1
-	return loaded, node
+	return loadInto(s, node, existing, counts), node
 end
 
 -- Returns the instance and the node to remember.
@@ -603,7 +612,7 @@ end
 
 -- -- Studio -> disk: watching ----------------------------------------------------
 
-local saveModel, saveModels
+local saveModel, saveModels, recordLoads
 
 local function modelEdited(s, key: string)
 	s.dirtyModels[key] = os.clock()
@@ -776,16 +785,26 @@ local function applyFull(s, data: any): (Counts, { string })
 			unhook(s, key)
 		end
 	end
-	-- Studio's models win: each is saved over its file (the daemon writes only a difference)
+	-- each model Studio kept goes to the daemon, which compares both sides with the version they
+	-- last agreed on: the side that changed since wins (Studio, when both did)
 	s.saving = true
 	for _, key in kept do
 		s.dirtyModels[key] = nil
-		local ok, err = pcall(saveModel, s, key, "")
+		local ok, action = pcall(saveModel, s, key, "connect", "")
+		local entry = s.known[key]
 		if not ok then
-			table.insert(errors, `{display(string.split(key, SEP))}: not saved: {err}`)
+			table.insert(errors, `{display(string.split(key, SEP))}: not saved: {action}`)
+		elseif action == "load" and entry then
+			local loadedOk, loaded = pcall(loadInto, s, entry, entry.instance, counts)
+			if loadedOk then
+				remember(s, entry, loaded)
+			else
+				table.insert(errors, `{display(entry.path)}: {loaded}`)
+			end
 		end
 	end
 	s.saving = false
+	recordLoads(s)
 	s.epoch, s.version, s.roots, s.name = data.epoch, data.version, data.roots, data.name
 	watchEditor(s)
 	return counts, errors
@@ -831,6 +850,7 @@ local function applyDelta(s, data: any): (Counts, { string })
 			remember(s, effective, result)
 		end
 	end
+	recordLoads(s)
 	s.version = data.version
 	if data.writeback ~= nil then
 		s.writeback = data.writeback and s.writebackEnabled
@@ -1009,13 +1029,16 @@ end
 -- Saves one synced model over its file; the answer's hash keeps the next delta from reloading it.
 -- `base` is the file Studio's version comes from: the daemon backs up a file that is not it.
 -- A full sync passes "", since Studio's instance did not come from the file as it is now.
-function saveModel(s, key: string, base: string?)
+-- Sends a synced model to the daemon (writeback.rs save_model has the modes) and returns the
+-- daemon's action: "saved", "none", "recorded", or "load" (the file is newer: load it).
+function saveModel(s, key: string, mode: string, base: string?): string?
 	local entry = s.known[key]
 	if not (entry and entry.kind == "model" and entry.instance.Parent) then
-		return
+		return nil
 	end
 	local path = HttpService:UrlEncode(HttpService:JSONEncode(entry.path))
-	local route = `/save?upload={HttpService:GenerateGUID(false)}&base={base or entry.modelHash}&path={path}`
+	local route =
+		`/save?upload={HttpService:GenerateGUID(false)}&mode={mode}&base={base or entry.modelHash}&path={path}`
 	local status, body = upload(s, route, serializeBase64(entry.instance))
 	if status ~= 200 then
 		error(`daemon answered {status}: {body}`)
@@ -1030,9 +1053,25 @@ function saveModel(s, key: string, base: string?)
 			s.log(`[studio-sync] saved {display(entry.path)}`)
 		end
 		entry.modelHash = result.modelHash
-	else
-		warnOnce(s, "save" .. key .. tostring(result.error), `{display(entry.path)} not saved: {result.error}`)
+		return result.action
 	end
+	warnOnce(s, "save" .. key .. tostring(result.error), `{display(entry.path)} not saved: {result.error}`)
+	return nil
+end
+
+-- Tells the daemon what each model loaded from its file serializes to in Studio, so the next
+-- connect knows Studio did not change it.
+function recordLoads(s)
+	local wasSaving = s.saving
+	s.saving = true
+	for key in s.loaded do
+		s.loaded[key] = nil
+		local entry = s.known[key]
+		if entry and saveable(s, entry) then
+			pcall(saveModel, s, key, "loaded", entry.modelHash)
+		end
+	end
+	s.saving = wasSaving
 end
 
 -- Saves the models that have been quiet for MODEL_DEBOUNCE, one at a time.
@@ -1057,7 +1096,7 @@ function saveModels(s)
 		s.saving = true
 		for _, key in due do
 			s.dirtyModels[key] = nil
-			local ok, err = pcall(saveModel, s, key)
+			local ok, err = pcall(saveModel, s, key, "edit")
 			if not ok then
 				warnOnce(s, "save" .. tostring(err), `saving {display(string.split(key, SEP))} failed: {err}`)
 			end

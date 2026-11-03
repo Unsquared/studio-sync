@@ -590,11 +590,16 @@ async fn post(daemon: Arc<Daemon>, route: &str, q: Query, body: Bytes) -> Handle
 			project.ready().await.map_err(|e| reject(503, e))?;
 			let path = q.path("path")?;
 			let base = q.get("base").unwrap_or_default().to_string();
+			let mode = q.get("mode").unwrap_or("edit").to_string();
+			let place = match q.some("session") {
+				Some(session) => format!("copy-{session}"),
+				None => q.get("placeId").unwrap_or_default().to_string(),
+			};
 			blocking(move || {
 				let data = BASE64.decode(data.trim()).map_err(|e| reject(400, e.to_string()))?;
 				let result = {
 					let mut st = project.state();
-					Writer::new(&project.dir, &project.name, &mut st).save_model(&path, &base, &data)
+					Writer::new(&project.dir, &project.name, &mut st).save_model(&path, &place, &mode, &base, &data)
 				};
 				Ok(Reply::json(200, &result.unwrap_or_else(|e| json!({ "ok": false, "error": e.0 }))))
 			})

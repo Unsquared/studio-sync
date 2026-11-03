@@ -4,14 +4,15 @@
 // to backups instead. Also the backups of what a full sync replaces.
 
 use crate::log;
-use crate::paths::{backup_root, normalize};
+use crate::paths::{agreed_file, backup_root, normalize};
 use crate::project::State;
 use crate::tree::{Kind, Place, key_of, starts_with};
-use crate::util::{Error, Res, mkdirs, read, rename, sha, stamp, write};
+use crate::util::{Error, Res, mkdirs, read, read_json, rename, sha, stamp, write};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -186,11 +187,19 @@ impl<'a> Writer<'a> {
 		Ok(rel)
 	}
 
-	// Saves a model from Studio over its file: Studio is the source of truth for models. `base`
-	// is the hash of the file Studio's version comes from; a file that is not that (a git pull
-	// Studio did not apply, or "" on connect) is backed up first. Answers the file's new hash,
-	// which Studio keeps so it doesn't reload the model.
-	pub fn save_model(&mut self, path: &[String], base: &str, data: &[u8]) -> Res<Value> {
+	// Saves a model from Studio over its file, or says which side wins. `place` is the Studio's
+	// place (or copy); `mode` is what Studio is doing:
+	// - "connect": Studio's model as it is at a connect. Compared with the version both last
+	//   agreed on, only the side that changed since wins: "load" (the file changed, as after a
+	//   git pull) or "saved" (Studio changed). When both changed, or nothing is agreed yet,
+	//   Studio wins and the file goes to backups first.
+	// - "edit": Studio edited the model. `base` is the file hash Studio's version comes from; a
+	//   file that is not that is backed up first.
+	// - "loaded": Studio just loaded the file whose hash is `base`. Nothing is written; its
+	//   serialization is recorded (it differs from the file: Studio gives the scripts inside new
+	//   ScriptGuids).
+	// Answers `{ ok, action, modelHash, replaced? }`; Studio keeps modelHash, the file's hash.
+	pub fn save_model(&mut self, path: &[String], place: &str, mode: &str, base: &str, data: &[u8]) -> Res<Value> {
 		if !self.st.config.writeback {
 			crate::bail!("writeback is off in studio-sync.json");
 		}
@@ -203,28 +212,70 @@ impl<'a> Writer<'a> {
 		}
 		let full = self.abs(&file)?;
 		let old = read(&full)?;
-		let (current, hash) = (sha(&old), sha(data));
-		let mut replaced = None;
-		if hash != current {
-			if current != base {
-				let dir = backup_dir(self.name, "replaced");
-				let saved = dir.join(&file);
-				mkdirs(saved.parent().unwrap_or(&dir))?;
-				write(&saved, &old)?;
-				log!(
-					"[{}] {}: Studio's version replaces a file it did not come from (backed up in {})",
-					self.name,
-					file.display(),
-					dir.display()
-				);
-				replaced = Some(dir);
-			}
-			write(&full, data)?;
-			log!("[{}] <- Studio: {} ({} bytes)", self.name, file.display(), data.len());
+		let (on_disk, studio) = (sha(&old), sha(data));
+		let key = file.to_string_lossy().replace('\\', "/");
+		let last = self.agreed().0.get(place).and_then(|m| m.get(&key)).cloned();
+
+		let answer = |action: &str, hash: &str| json!({ "ok": true, "action": action, "modelHash": hash });
+		if mode == "loaded" {
+			self.agree(place, key, [base.to_string(), studio])?;
+			return Ok(answer("recorded", base));
 		}
-		Ok(json!({ "ok": true, "modelHash": hash, "replaced": replaced }))
+		if on_disk == studio {
+			self.agree(place, key, [on_disk.clone(), studio])?;
+			return Ok(answer("none", &on_disk));
+		}
+		let file_changed = match (&last, mode) {
+			(_, "edit") => on_disk != base,
+			(Some([agreed_file, _]), _) => *agreed_file != on_disk,
+			(None, _) => true, // nothing agreed: the file may hold work Studio lacks
+		};
+		if mode == "connect" && last.as_ref().is_some_and(|[_, agreed_studio]| *agreed_studio == studio) {
+			// Studio is as agreed: the file is newer, or differs only by ScriptGuids
+			return Ok(answer(if file_changed { "load" } else { "none" }, &on_disk));
+		}
+		let mut replaced = None;
+		if file_changed {
+			let dir = backup_dir(self.name, "replaced");
+			let saved = dir.join(&file);
+			mkdirs(saved.parent().unwrap_or(&dir))?;
+			write(&saved, &old)?;
+			let both = if last.is_some() || mode == "edit" { "changed in Studio and on disk" } else { "first connect" };
+			log!("[{}] {} ({both}): Studio's version wins; the file is backed up in {}", self.name, file.display(), dir.display());
+			replaced = Some(dir);
+		}
+		write(&full, data)?;
+		log!("[{}] <- Studio: {} ({} bytes)", self.name, file.display(), data.len());
+		self.agree(place, key, [studio.clone(), studio.clone()])?;
+		let mut result = answer("saved", &studio);
+		result["replaced"] = json!(replaced);
+		Ok(result)
+	}
+
+	fn agreed(&mut self) -> &mut Agreed {
+		let name = self.name;
+		self.st
+			.agreed
+			.get_or_insert_with(|| read_json(&agreed_file(name)).ok().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default())
+	}
+
+	fn agree(&mut self, place: &str, file: String, hashes: [String; 2]) -> Res<()> {
+		let name = self.name;
+		let agreed = self.agreed();
+		if agreed.0.get(place).and_then(|m| m.get(&file)) == Some(&hashes) {
+			return Ok(());
+		}
+		agreed.0.entry(place.to_string()).or_default().insert(file, hashes);
+		let target = agreed_file(name);
+		mkdirs(target.parent().unwrap_or(&target))?;
+		write(&target, serde_json::to_vec(&agreed.0)?)
 	}
 }
+
+// By place, then model file: the hash of the file and of Studio's serialization when the two
+// last matched (they differ when Studio has loaded the file: new ScriptGuids).
+#[derive(Default, Serialize, Deserialize)]
+pub struct Agreed(BTreeMap<String, BTreeMap<String, [String; 2]>>);
 
 #[derive(Deserialize)]
 pub struct BackupItem {

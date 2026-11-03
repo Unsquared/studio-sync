@@ -1,7 +1,10 @@
 // End to end against a real daemon on a spare port, with a throwaway project
 // and a fake plugin speaking HTTP and its WebSocket. Needs `rojo` on PATH.
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
+use sha1::{Digest, Sha1};
 use std::fs;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -253,7 +256,7 @@ fn end_to_end() {
 	browsers_are_refused(&h);
 	disk_edit_arrives_and_wait_sees_it(&mut h);
 	pull_saves_rbxm(&mut h);
-	model_edits_save_and_conflict(&mut h);
+	model_saves(&mut h);
 	snapshot_replaces_dir(&mut h);
 	build_layers_service_settings(&h);
 	commands_go_where_from_says(&mut h);
@@ -364,37 +367,58 @@ fn snapshot_replaces_dir(h: &mut Harness) {
 	assert_eq!(fs::read_to_string(old.join("Workspace").join("Old.rbxm")).unwrap(), "stale");
 }
 
-// A model from Studio is saved over its file; a file it did not come from is backed up first.
-fn model_edits_save_and_conflict(h: &mut Harness) {
+// Models: an edit saves over the file (backing up a file it did not come from); a connect
+// compares both sides with the version they last agreed on, and the side that changed wins.
+fn model_saves(h: &mut Harness) {
 	let tree = until(|| {
 		let node =
 			h.get("/tree")["nodes"].as_array().unwrap().iter().find(|n| joined(&n["path"]) == "ReplicatedStorage.shared.Tree").cloned();
 		node.filter(|n| n["kind"] == "model")
 	});
-	let base = tree["modelHash"].as_str().unwrap().to_string();
 	let path = encode(&tree["path"].to_string());
-	let save = |base: &str, upload: &str, data: &str| -> Value {
-		let route = format!("{}/save?placeId={PLACE}&upload={upload}&base={base}&path={path}", h.base);
+	let send = |mode: &str, base: &str, text: &str| -> Value {
+		let data = BASE64.encode(text);
+		let route = format!("{}/save?placeId={PLACE}&upload={mode}{base}&mode={mode}&base={base}&path={path}", h.base);
 		h.raw_post(&format!("{route}&part=1&last=0"), &data[..4]);
 		serde_json::from_str(&h.raw_post(&format!("{route}&part=2&last=1"), &data[4..]).1).unwrap()
 	};
-	let saved = save(&base, "m1", "ZWRpdGVkIGluIHN0dWRpbw=="); // "edited in studio"
-	assert_eq!(saved["ok"], true, "{saved}");
-	assert_eq!(h.read("src/shared/Tree.rbxm"), "edited in studio");
-	assert_ne!(saved["modelHash"], base);
+	let hash = |text: &str| Sha1::digest(text)[..8].iter().map(|b| format!("{b:02x}")).collect::<String>();
+	let file = "src/shared/Tree.rbxm";
 
-	assert!(saved["replaced"].is_null(), "the file was what Studio loaded: {saved}");
+	// an edit of what Studio loaded: saved, nothing backed up
+	let base = tree["modelHash"].as_str().unwrap().to_string();
+	let r = send("edit", &base, "v1");
+	assert_eq!((r["action"].as_str(), r["replaced"].is_null()), (Some("saved"), true), "{r}");
+	assert_eq!(h.read(file), "v1");
+	// an edit from an older file: Studio wins, the newer file goes to backups
+	let r = send("edit", &base, "v2");
+	assert_eq!(fs::read_to_string(Path::new(r["replaced"].as_str().unwrap()).join(file)).unwrap(), "v1", "{r}");
+	assert_eq!(h.read(file), "v2");
 
-	let other = save(&base, "m2", "c3R1ZGlvIHdpbnM="); // "studio wins", from a file older than the one on disk
-	assert_eq!(other["ok"], true, "{other}");
-	assert_eq!(h.read("src/shared/Tree.rbxm"), "studio wins");
-	let replaced = Path::new(other["replaced"].as_str().unwrap()).join("src/shared/Tree.rbxm");
-	assert_eq!(fs::read_to_string(replaced).unwrap(), "edited in studio");
+	// connect, nothing changed since the last save: nothing to do
+	assert_eq!(send("connect", "", "v2")["action"], "none");
+	// the file changed (a git pull), Studio did not: load it
+	h.write(file, "pulled");
+	assert_eq!(send("connect", "", "v2")["action"], "load");
+	assert_eq!(h.read(file), "pulled");
+	// Studio loads it; its serialization differs (new ScriptGuids) and is recorded
+	assert_eq!(send("loaded", &hash("pulled"), "pulled, as Studio has it")["action"], "recorded");
+	assert_eq!(send("connect", "", "pulled, as Studio has it")["action"], "none", "no rewrite for ScriptGuids");
+	// Studio changed offline, the file did not: Studio's version saves
+	let r = send("connect", "", "studio offline edit");
+	assert_eq!((r["action"].as_str(), r["replaced"].is_null()), (Some("saved"), true), "{r}");
+	// both changed: Studio wins, the file goes to backups
+	h.write(file, "pulled again");
+	let r = send("connect", "", "studio edit again");
+	assert_eq!(r["action"], "saved");
+	assert_eq!(fs::read_to_string(Path::new(r["replaced"].as_str().unwrap()).join(file)).unwrap(), "pulled again");
+	assert_eq!(h.read(file), "studio edit again");
 
 	let script = encode(r#"["ReplicatedStorage","shared","a"]"#);
-	let refused: Value =
-		serde_json::from_str(&h.raw_post(&format!("{}/save?placeId={PLACE}&upload=m3&base=x&path={script}&last=1", h.base), "eA==").1)
-			.unwrap();
+	let refused: Value = serde_json::from_str(
+		&h.raw_post(&format!("{}/save?placeId={PLACE}&upload=m9&mode=edit&base=x&path={script}&last=1", h.base), "eA==").1,
+	)
+	.unwrap();
 	assert!(refused["error"].as_str().unwrap().contains("not a model file"), "{refused}");
 }
 

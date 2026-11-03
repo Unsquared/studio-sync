@@ -8,7 +8,7 @@ Sync between Roblox Studio and files (code one way, `.rbxm` models both ways): a
 - The daemon never polls. File events (the `notify` crate) drive regeneration; each Studio's socket task waits on the project's `Notify`. Keep idle CPU at zero.
 - Live sync needs no external tool: `src/layout.rs` maps files to instances by Rojo's rules, and `cargo test -- --include-ignored` checks it against `rojo sourcemap` on every registered project. Only `build` runs Rojo, until Roblox publishes its own place format. Don't add Lune, rbx-dom or other code that reads place files: they need updates whenever Roblox changes.
 - The code must work on macOS and Windows. Use `Path::join`. Do not use shell-specific commands outside `src/install.rs` and `src/open.rs`.
-- Never lose work. Copy anything that the sync overwrites or deletes to `backups/` first. Disk wins for code; Studio wins for `.rbxm` models (git can restore a file, nothing restores Studio).
+- Never lose work. Copy anything that the sync overwrites or deletes to `backups/` first. Disk wins for code. For `.rbxm` models the side that changed since they last agreed wins, and Studio wins when both did (git can restore a file, nothing restores Studio).
 - Change `version` in Cargo.toml and `PLUGIN_VERSION` in plugin/Sync.luau together. `status` flags a mismatch.
 
 ## Plugin changes

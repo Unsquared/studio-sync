@@ -52,7 +52,7 @@ Then, in each project, run `studio-sync add` and put your dev place id in `studi
 
 ## Rules
 
-- **Disk wins for code, Studio wins for models.** Script edits in Studio are not saved. On a connect, Studio's `.rbxm` models are saved over their files; `git checkout` a file to take the git version instead.
+- **Disk wins for code; for models, the side that changed wins.** Script edits in Studio are not saved. On a connect, a model file changed by a `git pull` loads in Studio, and a model edited in Studio is saved over its file. If both changed, Studio wins and the file goes to backups.
 - **Connect makes Studio's code match the disk.** Under the roots, Studio-only scripts and instances are removed.
 - **Nothing is lost.** The tool copies all that it overwrites or deletes to `~/.config/studio-sync/backups/`.
 - **One syncer for each place.** Use your own dev place, never the live place.
