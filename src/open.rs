@@ -57,8 +57,30 @@ fn windows_launch(target: &str, is_file: bool) -> Res<Command> {
 	} else {
 		format!("\"{target}\"")
 	};
+	// Off the caller's console and process group: attached, Studio dies with the terminal
+	// (or agent shell) that ran `open`, a second after it connects.
+	const DETACHED_PROCESS: u32 = 0x0000_0008;
+	const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+	// The child inherits every inheritable handle, and this process's own stdio came in
+	// inheritable: Studio would hold the caller's output pipe open, so a shell reading it
+	// (`studio-sync open --copy | tail`, an agent's tool call) waits until Studio exits.
+	#[link(name = "kernel32")]
+	unsafe extern "system" {
+		fn GetStdHandle(which: u32) -> isize;
+		fn SetHandleInformation(handle: isize, mask: u32, flags: u32) -> i32;
+	}
+	const HANDLE_FLAG_INHERIT: u32 = 1;
+	for which in [-10i32, -11, -12] {
+		// SAFETY: plain Win32 calls on this process's standard handles; a failure leaves the flag as it was.
+		unsafe {
+			let handle = GetStdHandle(which as u32);
+			if handle != 0 && handle != -1 {
+				SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+			}
+		}
+	}
 	let mut command = Command::new("cmd");
-	command.raw_arg(format!("/c start \"\" /min {line}"));
+	command.raw_arg(format!("/c start \"\" /min {line}")).creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 	Ok(command)
 }
 
