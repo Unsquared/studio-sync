@@ -1,6 +1,6 @@
 [package]
 name = "studio-sync"
-version = "3.2.0"
+version = "3.2.1"
 license = "MIT"
 edition = "2024"
 description = "Two-way sync between Roblox Studio and your files, built for agents: an always-on daemon plus a Studio plugin"

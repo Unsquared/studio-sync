@@ -34,7 +34,7 @@ local HttpService = game:GetService("HttpService")
 local ScriptEditorService = game:GetService("ScriptEditorService")
 local SerializationService = game:GetService("SerializationService")
 
-local PLUGIN_VERSION = "3.2.0"
+local PLUGIN_VERSION = "3.2.1"
 local PLAY_NAME_SECONDS = 30
 local DEFAULT_URL = "http://localhost:34999"
 local RETRY_OFFLINE = 3

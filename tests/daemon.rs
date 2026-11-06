@@ -195,7 +195,11 @@ fn start() -> Harness {
 	fs::create_dir_all(&home).unwrap();
 	fs::create_dir_all(&project).unwrap();
 	// as `add` registers it, and as a CLI's current directory reads (macOS: /var is a link)
-	let (tmp, home, project) = (fs::canonicalize(&tmp).unwrap(), fs::canonicalize(&home).unwrap(), fs::canonicalize(&project).unwrap());
+	let plain = |dir: &Path| {
+		let real = fs::canonicalize(dir).unwrap();
+		real.to_str().and_then(|s| s.strip_prefix(r"\\?\")).map_or(real.clone(), PathBuf::from)
+	};
+	let (tmp, home, project) = (plain(&tmp), plain(&home), plain(&project));
 	fs::copy(Path::new(ROOT).join("rokit.toml"), tmp.join("rokit.toml")).unwrap();
 	let agent = Agent::new_with_config(Agent::config_builder().http_status_as_error(false).build());
 	let mut h = Harness {
@@ -684,6 +688,13 @@ fn wait_says_what_it_found(h: &mut Harness) {
 	until(|| (h.get("/status")["projects"][0]["plays"].as_array().unwrap().is_empty()).then_some(()));
 	studio.close();
 	until(|| (h.get("/status")["projects"][0]["clients"].as_array().unwrap().len() == 1).then_some(()));
+
+	// Windows keeps the current directory as it was typed: it still finds the project
+	if cfg!(windows) {
+		let typed = PathBuf::from(h.project.to_string_lossy().to_uppercase());
+		let (_, _, err) = cli(h, &typed, &["wait", "--timeout", "1"]);
+		assert!(!err.contains("no registered project"), "{err}");
+	}
 }
 
 fn claim_leaves_another_checkouts_studio_alone(h: &Harness) {

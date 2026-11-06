@@ -170,6 +170,11 @@ fn cwd() -> PathBuf {
 	std::env::current_dir().unwrap_or_else(|e| fail(format!("the current directory: {e}"), 1))
 }
 
+// The current directory as the registry has it: Windows keeps it as it was typed, in any case.
+fn here() -> PathBuf {
+	real(&cwd()).unwrap_or_else(|_| cwd())
+}
+
 // The first argument that is not a flag, as a real path; else the current directory.
 fn target(args: &[String]) -> PathBuf {
 	let dir = args.iter().find(|a| !a.starts_with('-')).map(PathBuf::from).unwrap_or_else(cwd);
@@ -178,7 +183,7 @@ fn target(args: &[String]) -> PathBuf {
 
 // The project dir containing the current directory, and its merged config.
 fn project_here() -> (PathBuf, Config) {
-	let start = real(&cwd()).unwrap_or_else(|_| cwd());
+	let start = here();
 	let Some(dir) = start.ancestors().find(|d| d.join(CONFIG_FILE).exists()) else {
 		fail(format!("no {CONFIG_FILE} in {} or above (studio-sync add)", start.display()), 1)
 	};
@@ -302,7 +307,7 @@ fn status() {
 		println!("  the daemon is {version}, this checkout is {VERSION}: studio-sync install");
 	}
 	let projects = status["projects"].as_array().map(Vec::as_slice).unwrap_or_default();
-	let here = real(&cwd()).unwrap_or_else(|_| cwd());
+	let here = here();
 	let mine = here.ancestors().find_map(|d| projects.iter().find(|p| p["dir"].as_str() == d.to_str()));
 	let shown: Vec<&Value> = match mine {
 		Some(project) => vec![project],
@@ -391,14 +396,14 @@ const WAIT_NAMES: usize = 10;
 
 fn wait(args: &[String]) {
 	if args.iter().any(|a| a == "--full") {
-		let dir = cwd();
+		let dir = here();
 		let result = command_result(client::post(&format!("/resync?{}", client::query(&[("dir", &dir.to_string_lossy())]))));
 		if result["ok"] != true {
 			fail(&result, 1);
 		}
 	}
 	let timeout: u64 = flag(args, "--timeout").and_then(|t| t.parse().ok()).unwrap_or(30);
-	let dir = cwd();
+	let dir = here();
 	let (code, text) =
 		client::get(&format!("/wait?{}", client::query(&[("dir", &dir.to_string_lossy()), ("timeout", &timeout.to_string())]))).or_fail();
 	if code != 200 {
@@ -477,7 +482,7 @@ fn pull(args: &[String]) {
 		let full = std::path::absolute(f).unwrap_or_else(|_| PathBuf::from(f));
 		snapshot::relative(&full, &target(&[])).to_string_lossy().into_owned()
 	});
-	let dir = cwd();
+	let dir = here();
 	let path = serde_json::to_string(&parse_instance_path(instance)).unwrap_or_default();
 	let mut query = vec![("dir", dir.to_string_lossy().into_owned()), ("path", path), ("file", file.unwrap_or_default())];
 	if let Some(from) = from {
@@ -492,7 +497,7 @@ fn pull(args: &[String]) {
 }
 
 fn snapshot_command(args: &[String]) {
-	let dir = cwd();
+	let dir = here();
 	let dir = dir.to_string_lossy();
 	let (from, _) = from_flag(args);
 	let mut pairs = vec![("dir", &*dir)];
