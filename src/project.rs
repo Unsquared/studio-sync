@@ -6,8 +6,9 @@
 // connects, the CLI asks), and drops it after IDLE_AFTER with no Studio and no use.
 
 use crate::config::Config;
+use crate::events;
 use crate::log;
-use crate::paths::staging_root;
+use crate::paths::{VERSION, staging_root};
 use crate::tree::{self, Generated, Node, Nodes, PACKAGE_DIRS, Place, Reuse};
 use crate::util::sha;
 use crate::watch::{Change, Watch};
@@ -27,6 +28,14 @@ const QUIET: Duration = Duration::from_millis(50);
 const IDLE_AFTER: Duration = Duration::from_secs(10 * 60);
 const IDLE_CHECK: Duration = Duration::from_secs(60);
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
+// How long a `wait` gives a Studio to save its model edits. One too busy to answer doesn't fail the wait.
+const FLUSH_LIMIT: Duration = Duration::from_secs(10);
+// A `wait` with no Studio gives one this long to appear, unless one is in the middle of connecting:
+// it counts as connected only after its full sync, which takes a while with many models.
+const NO_STUDIO_GRACE: Duration = Duration::from_secs(3);
+const CONNECTING_FOR: Duration = Duration::from_secs(60);
+// A `wait` checks what Studio holds, repairs it, and checks once more.
+const VERIFY_ROUNDS: u32 = 2;
 
 // A Studio, connected while its socket is open.
 pub struct Client {
@@ -37,6 +46,12 @@ pub struct Client {
 	pub session: Option<String>,
 	// the version it has applied
 	pub version: u64,
+	// the last flush it has finished
+	flushed: u64,
+	// the last check of what it holds (see verify)
+	verified: u64,
+	pub missing: Vec<String>,
+	pub edited: Vec<String>,
 	pub plugin: String,
 	pub errors: Vec<String>,
 }
@@ -56,8 +71,17 @@ impl Client {
 			"version": self.version,
 			"plugin": self.plugin,
 			"errors": self.errors,
+			"missing": self.missing,
+			"edited": self.edited,
 		})
 	}
+}
+
+// A running Play, which holds a socket open.
+pub struct Play {
+	pub who: String,
+	// the version when it started: what it runs
+	pub version: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -110,13 +134,8 @@ pub struct Changes {
 pub struct Rung {
 	epoch: String,
 	version: u64,
-}
-
-impl Rung {
-	// The client's own state when its socket opens: what it fetched before.
-	pub fn new(epoch: &str, version: u64) -> Rung {
-		Rung { epoch: epoch.to_string(), version }
-	}
+	flush: u64,
+	verify: u64,
 }
 
 // Studio's messages on its socket.
@@ -125,6 +144,21 @@ impl Rung {
 enum ClientMessage {
 	Applied {
 		version: u64,
+	},
+	Flushed {
+		seq: u64,
+	},
+	Verified {
+		seq: u64,
+		#[serde(default)]
+		missing: Vec<String>,
+		#[serde(default)]
+		edited: Vec<String>,
+	},
+	Event {
+		name: String,
+		#[serde(default)]
+		detail: Value,
 	},
 	Report {
 		#[serde(default)]
@@ -150,6 +184,15 @@ pub struct State {
 	pub error: Option<String>,
 	pub clients: BTreeMap<String, Client>,
 	pub commands: Vec<Command>,
+	// the last flush a `wait` asked for
+	flush: u64,
+	// the last check a `wait` asked for
+	verify: u64,
+	// model files saved from Studio since the last `wait`, which tells the caller
+	pub saved: BTreeSet<String>,
+	pub plays: BTreeMap<String, Play>,
+	// when a Studio last fetched the tree: it is connecting until its socket opens
+	last_tree: Option<Instant>,
 	active: bool,
 	last_used: Option<Instant>,
 }
@@ -159,9 +202,33 @@ impl State {
 		self.active
 	}
 
+	pub fn connecting(&self) -> bool {
+		self.clients.is_empty() && self.last_tree.is_some_and(|t| t.elapsed() < CONNECTING_FOR)
+	}
+
+	fn new_epoch(&mut self) {
+		self.epoch = format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis());
+	}
+
+	// Every Studio does a full sync: a new epoch makes its next /changes answer `full`, and the
+	// new version keeps a `wait` waiting for it.
+	fn resync(&mut self) {
+		self.new_epoch();
+		self.version += 1;
+		self.changes.clear();
+		self.log_base = self.version;
+	}
+
+	pub fn plays_view(&self) -> Vec<Value> {
+		self.plays
+			.values()
+			.map(|p| json!({ "who": p.who, "version": p.version, "stale": p.version > 0 && p.version < self.version }))
+			.collect()
+	}
+
 	fn activate(&mut self) {
 		self.active = true;
-		self.epoch = format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis());
+		self.new_epoch();
 		self.error = None;
 		self.last_used = Some(Instant::now());
 	}
@@ -211,6 +278,12 @@ impl State {
 			}
 		}
 		log!("[{name}] v{}: +{added} -{removed} ({:.2}s)", self.version, started.elapsed().as_secs_f64());
+		let ms = started.elapsed().as_millis() as u64;
+		let (touched, gone) = match self.changes.back().filter(|d| d.version == self.version) {
+			Some(delta) => (events::names(delta.upserts.values().map(|n| &n.path)), events::names(delta.removes.values())),
+			None => (json!({ "count": added }), json!({ "count": removed })),
+		};
+		events::record("regen", json!({ "project": name, "version": self.version, "ms": ms, "upserts": touched, "removes": gone }));
 	}
 
 	fn take_commands(&mut self, client: &str) -> Vec<Command> {
@@ -304,6 +377,18 @@ impl Project {
 
 	pub fn wake(&self) {
 		self.changed.notify_waiters();
+	}
+
+	// Closes the sockets of Studios on these places (not copies: a copy stays with its checkout).
+	pub fn release_places(&self, gone: impl Fn(u64) -> bool) {
+		let mut st = self.state();
+		let before = st.clients.len();
+		st.clients.retain(|_, c| c.session.is_some() || !gone(c.place_id));
+		let released = st.clients.len() != before;
+		drop(st);
+		if released {
+			self.wake();
+		}
 	}
 
 	// Removed from the registry: its sockets close, so their Studios look again.
@@ -472,7 +557,8 @@ impl Project {
 	}
 
 	pub fn tree(&self) -> Tree {
-		let st = self.state();
+		let mut st = self.state();
+		st.last_tree = Some(Instant::now());
 		Tree { info: st.info(&self.name), nodes: st.nodes.values().cloned().collect() }
 	}
 
@@ -482,8 +568,9 @@ impl Project {
 
 	// -- sockets ----------------------------------------------------------------
 
-	// A Studio's socket opened; it has applied `version`. Returns the connection's number.
-	pub fn connect(&self, id: &str, place_id: u64, session: Option<&str>, plugin: &str, version: u64) -> u64 {
+	// A Studio's socket opened; it has applied `version` of `epoch`. Returns the connection's number
+	// and what its socket has been told: what it fetched, and no question asked before it came.
+	pub fn connect(&self, id: &str, place_id: u64, session: Option<&str>, plugin: &str, epoch: &str, version: u64) -> (u64, Rung) {
 		let mut st = self.state();
 		st.last_used = Some(Instant::now());
 		let conn = st.clients.get(id).map_or(1, |c| c.conn + 1);
@@ -493,14 +580,23 @@ impl Project {
 			place_id,
 			session: session.map(str::to_string),
 			version,
+			flushed: st.flush,
+			verified: st.verify,
+			missing: Vec::new(),
+			edited: Vec::new(),
 			plugin: plugin.to_string(),
 			errors: Vec::new(),
 		};
 		log!("[{}] Studio connected ({}, plugin {plugin})", self.name, client.describe());
+		events::record(
+			"connect",
+			json!({ "project": self.name, "client": id, "who": client.describe(), "plugin": plugin, "version": version, "now": st.version }),
+		);
 		st.clients.insert(id.to_string(), client);
+		let rung = Rung { epoch: epoch.to_string(), version, flush: st.flush, verify: st.verify };
 		drop(st);
 		self.wake();
-		conn
+		(conn, rung)
 	}
 
 	pub fn disconnect(&self, id: &str, conn: u64) {
@@ -510,6 +606,10 @@ impl Project {
 			st.commands.retain(|c| c.client != id);
 			st.last_used = Some(Instant::now());
 			log!("[{}] Studio disconnected ({})", self.name, client.describe());
+			events::record(
+				"disconnect",
+				json!({ "project": self.name, "client": id, "who": client.describe(), "version": client.version }),
+			);
 		}
 		drop(st);
 		self.wake();
@@ -524,8 +624,16 @@ impl Project {
 		}
 		let mut out = Vec::new();
 		if st.version > 0 && (rung.epoch != st.epoch || rung.version != st.version) {
-			*rung = Rung { epoch: st.epoch.clone(), version: st.version };
+			(rung.epoch, rung.version) = (st.epoch.clone(), st.version);
 			out.push(json!({ "type": "version", "epoch": st.epoch, "version": st.version }).to_string());
+		}
+		if rung.flush != st.flush {
+			rung.flush = st.flush;
+			out.push(json!({ "type": "flush", "seq": st.flush }).to_string());
+		}
+		if rung.verify != st.verify {
+			rung.verify = st.verify;
+			out.push(json!({ "type": "verify", "seq": st.verify }).to_string());
 		}
 		for command in st.take_commands(id) {
 			out.push(serde_json::to_string(&command).unwrap_or_default());
@@ -541,12 +649,38 @@ impl Project {
 		let mut st = self.state();
 		let Some(client) = st.clients.get_mut(id) else { return };
 		match message {
-			ClientMessage::Applied { version } => client.version = version,
+			ClientMessage::Applied { version } => {
+				client.version = version;
+				events::record("applied", json!({ "project": self.name, "client": id, "version": version }));
+			}
+			ClientMessage::Flushed { seq } => client.flushed = seq,
+			ClientMessage::Verified { seq, missing, edited } => {
+				client.verified = seq;
+				if !missing.is_empty() {
+					// it is doing a full sync now: until its `applied`, a `wait` waits for it
+					log!("[{}] gone from Studio ({}), so a full sync: {}", self.name, client.describe(), missing.join(", "));
+					client.version = 0;
+				}
+				if !missing.is_empty() || !edited.is_empty() {
+					events::record(
+						"drift",
+						json!({ "project": self.name, "client": id, "who": client.describe(), "missing": missing, "edited": edited }),
+					);
+				}
+				client.missing = missing;
+				client.edited = edited;
+			}
 			ClientMessage::Report { errors } => {
 				for error in &errors {
 					log!("[{}] Studio: {error}", self.name);
 				}
+				if errors != client.errors {
+					events::record("errors", json!({ "project": self.name, "client": id, "errors": errors }));
+				}
 				client.errors = errors;
+			}
+			ClientMessage::Event { name, detail } => {
+				events::record("studio", json!({ "project": self.name, "client": id, "name": name, "detail": detail }));
 			}
 		}
 		drop(st);
@@ -557,29 +691,135 @@ impl Project {
 		&self.changed
 	}
 
-	// Regenerates now, then waits until every live Studio has applied the current version.
-	pub async fn wait_applied(&self, timeout: Duration) -> Value {
-		self.regenerate_now().await;
-		let deadline = tokio::time::Instant::now() + timeout;
+	// A Play's socket opened; it runs the current version.
+	pub fn play_started(&self, id: &str, who: String) {
+		let mut st = self.state();
+		let version = st.version;
+		log!("[{}] Play started ({who}) at v{version}", self.name);
+		events::record("play", json!({ "project": self.name, "who": who, "version": version, "running": true }));
+		st.plays.insert(id.to_string(), Play { who, version });
+	}
+
+	pub fn play_stopped(&self, id: &str) {
+		if let Some(play) = self.state().plays.remove(id) {
+			log!("[{}] Play stopped ({})", self.name, play.who);
+			events::record("play", json!({ "project": self.name, "who": play.who, "version": play.version, "running": false }));
+		}
+	}
+
+	// Makes every Studio match the disk again.
+	pub fn resync(&self) {
+		let mut st = self.state();
+		st.resync();
+		log!("[{}] resync: every Studio does a full sync for v{}", self.name, st.version);
+		events::record("resync", json!({ "project": self.name, "version": st.version }));
+		drop(st);
+		self.wake();
+	}
+
+	// Asks each Studio to save its model edits now and waits for the answers. An older plugin
+	// doesn't know the question.
+	async fn flush_models(&self, deadline: tokio::time::Instant) {
+		let limit = deadline.min(tokio::time::Instant::now() + FLUSH_LIMIT);
+		let seq = {
+			let mut st = self.state();
+			st.flush += 1;
+			st.flush
+		};
+		self.wake();
 		loop {
 			let notified = self.changed.notified();
 			tokio::pin!(notified);
 			notified.as_mut().enable();
-			{
+			if self.state().clients.values().filter(|c| c.plugin == VERSION).all(|c| c.flushed >= seq) {
+				return;
+			}
+			if tokio::time::timeout_at(limit, notified).await.is_err() {
+				return;
+			}
+		}
+	}
+
+	// Asks each Studio whether it still holds what the sync gave it, and waits for the answers.
+	async fn verify(&self, deadline: tokio::time::Instant) {
+		let limit = deadline.min(tokio::time::Instant::now() + FLUSH_LIMIT);
+		let seq = {
+			let mut st = self.state();
+			st.verify += 1;
+			st.verify
+		};
+		self.wake();
+		loop {
+			let notified = self.changed.notified();
+			tokio::pin!(notified);
+			notified.as_mut().enable();
+			if self.state().clients.values().filter(|c| c.plugin == VERSION).all(|c| c.verified >= seq) {
+				return;
+			}
+			if tokio::time::timeout_at(limit, notified).await.is_err() {
+				return;
+			}
+		}
+	}
+
+	// Waits until every live Studio has applied the current version; otherwise says why not.
+	async fn applied(&self, deadline: tokio::time::Instant, no_studio_by: tokio::time::Instant) -> Result<(), &'static str> {
+		loop {
+			let notified = self.changed.notified();
+			tokio::pin!(notified);
+			notified.as_mut().enable();
+			let wake_at = {
 				let mut st = self.state();
 				st.last_used = Some(Instant::now());
-				let clients: Vec<Value> = st.clients.values().map(Client::view).collect();
 				let behind = st.clients.values().any(|c| c.version < st.version);
-				let reply = |ok: bool, reason: Option<&str>| json!({ "ok": ok, "reason": reason, "clients": clients, "version": st.version, "error": st.error, "project": self.name });
-				if !clients.is_empty() && !behind {
-					return reply(true, None);
+				if !st.clients.is_empty() && !behind {
+					return Ok(());
 				}
-				if tokio::time::Instant::now() >= deadline {
-					return reply(false, Some(if clients.is_empty() { "no-studio" } else { "timeout" }));
+				let now = tokio::time::Instant::now();
+				let nobody = st.clients.is_empty() && !st.connecting();
+				if now >= deadline || (nobody && now >= no_studio_by) {
+					return Err(if st.clients.is_empty() { "no-studio" } else { "timeout" });
 				}
-			}
-			let _ = tokio::time::timeout_at(deadline, notified).await;
+				if nobody { no_studio_by } else { deadline }
+			};
+			let _ = tokio::time::timeout_at(wake_at, notified).await;
 		}
+	}
+
+	// Both directions settled: Studio's model edits are in their files, Studio has every file, and
+	// it still holds them. What it lost comes back with one full sync; if it is gone after that,
+	// the answer's `missing` says so.
+	pub async fn wait_applied(&self, timeout: Duration) -> Value {
+		let started = Instant::now();
+		let deadline = tokio::time::Instant::now() + timeout;
+		self.flush_models(deadline).await;
+		self.regenerate_now().await;
+		let no_studio_by = deadline.min(tokio::time::Instant::now() + NO_STUDIO_GRACE);
+		let mut checks = 0;
+		let outcome = loop {
+			if let Err(reason) = self.applied(deadline, no_studio_by).await {
+				break Err(reason);
+			}
+			self.verify(deadline).await;
+			checks += 1;
+			let st = self.state();
+			if checks >= VERIFY_ROUNDS || st.clients.values().all(|c| c.missing.is_empty() && c.version >= st.version) {
+				break Ok(());
+			}
+		};
+		let mut st = self.state();
+		let (ok, reason) = match outcome {
+			Ok(()) => (true, None),
+			Err(reason) => (false, Some(reason)),
+		};
+		let clients: Vec<Value> = st.clients.values().map(Client::view).collect();
+		let saved = if ok { std::mem::take(&mut st.saved) } else { BTreeSet::new() };
+		let plays = st.plays_view();
+		events::record(
+			"wait",
+			json!({ "project": self.name, "ms": started.elapsed().as_millis() as u64, "ok": ok, "reason": reason, "version": st.version, "clients": clients, "saved": saved, "plays": plays, "checks": checks }),
+		);
+		json!({ "ok": ok, "reason": reason, "clients": clients, "version": st.version, "error": st.error, "project": self.name, "saved": saved, "plays": plays })
 	}
 }
 

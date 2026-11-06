@@ -8,6 +8,7 @@
 // projects.json is watched, not polled.
 
 use crate::config::CONFIG_FILE;
+use crate::events;
 use crate::log;
 use crate::paths::{PORT, STATE_DIR, VERSION, projects_file};
 use crate::project::{Client, Command, Project, Rung};
@@ -202,6 +203,10 @@ impl Daemon {
 				}
 			}
 		}
+		// A place that moved to another checkout: its Studio connects again, and finds that one.
+		for project in self.projects() {
+			project.release_places(|place_id| registry.claims.get(&place_id.to_string()).is_some_and(|owner| owner != &project.dir));
+		}
 		*lock(&self.claims) = registry.claims;
 		*lock(&self.sessions) = registry.sessions;
 	}
@@ -212,7 +217,7 @@ impl Daemon {
 			let dir = lock(&self.sessions).get(session).map(|s| s.dir.clone());
 			return dir
 				.and_then(|dir| projects.into_iter().find(|p| p.dir == dir))
-				.ok_or_else(|| reject(404, format!("no project for copy {session} (studio-sync copies)")));
+				.ok_or_else(|| reject(404, format!("no project for copy {session} (studio-sync status)")));
 		}
 		let place_id = raw.and_then(|r| r.parse::<u64>().ok()).filter(|id| *id != 0);
 		let Some(place_id) = place_id else {
@@ -231,7 +236,7 @@ impl Daemon {
 			many => Err(reject(
 				409,
 				format!(
-					"place {place_id} is listed by {}: run `studio-sync claim` in the one to sync",
+					"place {place_id} is listed by {}: run `studio-sync open` in the one to sync",
 					many.iter().map(|p| p.dir.display().to_string()).collect::<Vec<_>>().join(" and ")
 				),
 			)),
@@ -266,6 +271,8 @@ impl Daemon {
 					"writeback": st.config.writeback,
 					"error": st.error,
 					"clients": st.clients.values().map(Client::view).collect::<Vec<_>>(),
+					"connecting": st.connecting(),
+					"plays": st.plays_view(),
 				})
 			})
 			.collect();
@@ -370,28 +377,68 @@ fn allowed(req: &Request<Incoming>) -> Result<(), Reject> {
 	Ok(())
 }
 
-// GET /socket?placeId&session&client&plugin&epoch&version: a Studio's connection, after its GET /tree.
-fn open_socket(daemon: Arc<Daemon>, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Reject> {
+// The accept key of a WebSocket request.
+fn socket_key(req: &Request<Incoming>) -> Result<String, Reject> {
 	let header = |name: &str| req.headers().get(name).and_then(|h| h.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
 	if !header("upgrade").contains("websocket") || !header("connection").contains("upgrade") {
 		return Err(reject(426, "a WebSocket"));
 	}
-	let Some(key) = req.headers().get("sec-websocket-key").map(|k| derive_accept_key(k.as_bytes())) else {
-		return Err(reject(400, "no Sec-WebSocket-Key"));
-	};
+	req.headers().get("sec-websocket-key").map(|k| derive_accept_key(k.as_bytes())).ok_or_else(|| reject(400, "no Sec-WebSocket-Key"))
+}
+
+fn switching_protocols(key: &str) -> Result<Response<Full<Bytes>>, Reject> {
+	let mut response = Response::new(Full::new(Bytes::new()));
+	*response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+	let headers = response.headers_mut();
+	headers.insert("upgrade", hyper::header::HeaderValue::from_static("websocket"));
+	headers.insert("connection", hyper::header::HeaderValue::from_static("Upgrade"));
+	headers.insert("sec-websocket-accept", key.parse().map_err(|_| reject(500, "accept key"))?);
+	Ok(response)
+}
+
+// GET /play?placeId&session&client: a running Play, while its socket is open. It says nothing more.
+fn open_play(daemon: Arc<Daemon>, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Reject> {
+	let key = socket_key(&req)?;
 	let q = Query::parse(req.uri().query());
 	let project = daemon.by_place(q.get("placeId"), q.some("session"))?;
 	let Some(client) = q.some("client").map(str::to_string) else {
 		return Err(reject(400, "no client"));
 	};
-	let conn = project.connect(
+	let who = match q.some("session") {
+		Some(session) => format!("copy {session}"),
+		None => format!("place {}", q.get("placeId").unwrap_or_default()),
+	};
+	project.play_started(&client, who);
+	tokio::spawn(async move {
+		if let Ok(upgraded) = hyper::upgrade::on(req).await {
+			let mut socket = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
+			while let Some(Ok(message)) = socket.next().await {
+				if message.is_close() {
+					break;
+				}
+			}
+		}
+		project.play_stopped(&client);
+	});
+	switching_protocols(&key)
+}
+
+// GET /socket?placeId&session&client&plugin&epoch&version: a Studio's connection, after its GET /tree.
+fn open_socket(daemon: Arc<Daemon>, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Reject> {
+	let key = socket_key(&req)?;
+	let q = Query::parse(req.uri().query());
+	let project = daemon.by_place(q.get("placeId"), q.some("session"))?;
+	let Some(client) = q.some("client").map(str::to_string) else {
+		return Err(reject(400, "no client"));
+	};
+	let (conn, rung) = project.connect(
 		&client,
 		q.number("placeId").unwrap_or(0),
 		q.some("session"),
 		q.get("plugin").unwrap_or("?"),
+		q.get("epoch").unwrap_or_default(),
 		q.number("version").unwrap_or(0),
 	);
-	let rung = Rung::new(q.get("epoch").unwrap_or_default(), q.number("version").unwrap_or(0));
 	tokio::spawn(async move {
 		if let Ok(upgraded) = hyper::upgrade::on(req).await {
 			let socket = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
@@ -400,13 +447,7 @@ fn open_socket(daemon: Arc<Daemon>, req: Request<Incoming>) -> Result<Response<F
 		project.disconnect(&client, conn);
 		daemon.abandon(&client);
 	});
-	let mut response = Response::new(Full::new(Bytes::new()));
-	*response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-	let headers = response.headers_mut();
-	headers.insert("upgrade", hyper::header::HeaderValue::from_static("websocket"));
-	headers.insert("connection", hyper::header::HeaderValue::from_static("Upgrade"));
-	headers.insert("sec-websocket-accept", key.parse().map_err(|_| reject(500, "accept key"))?);
-	Ok(response)
+	switching_protocols(&key)
 }
 
 // One open socket: sends what the project has for this client whenever it changes, and
@@ -512,6 +553,12 @@ async fn post(daemon: Arc<Daemon>, route: &str, q: Query, body: Bytes) -> Handle
 	let text = || String::from_utf8_lossy(&body).into_owned();
 	match route {
 		// from the CLI
+		"/resync" => {
+			let project = daemon.by_dir(q.get("dir"))?;
+			project.ready().await.map_err(|e| reject(503, e))?;
+			project.resync();
+			return Ok(Reply::json(200, &json!({ "ok": true })));
+		}
 		"/pull/request" => {
 			let project = daemon.by_dir(q.get("dir"))?;
 			let file = q.some("file").map(str::to_string);
@@ -595,12 +642,20 @@ async fn post(daemon: Arc<Daemon>, route: &str, q: Query, body: Bytes) -> Handle
 				Some(session) => format!("copy-{session}"),
 				None => q.get("placeId").unwrap_or_default().to_string(),
 			};
+			let sessions = lock(&daemon.sessions).clone();
 			blocking(move || {
 				let data = BASE64.decode(data.trim()).map_err(|e| reject(400, e.to_string()))?;
 				let result = {
 					let mut st = project.state();
-					Writer::new(&project.dir, &project.name, &mut st).save_model(&path, &place, &mode, &base, &data)
+					Writer::new(&project.dir, &project.name, &mut st).save_model(&path, &place, &mode, &base, &data, &sessions)
 				};
+				let action = result.as_ref().map_or("failed", |r| r["action"].as_str().unwrap_or("?"));
+				if !["none", "recorded"].contains(&action) {
+					events::record(
+						"model",
+						json!({ "project": project.name, "place": place, "mode": mode, "path": path.join("."), "file": result.as_ref().ok().map(|r| r["file"].clone()), "bytes": data.len(), "action": action, "replaced": result.as_ref().ok().map(|r| r["replaced"].clone()), "error": result.as_ref().err().map(|e| e.0.clone()) }),
+					);
+				}
 				Ok(Reply::json(200, &result.unwrap_or_else(|e| json!({ "ok": false, "error": e.0 }))))
 			})
 			.await
@@ -714,6 +769,7 @@ async fn respond(daemon: Arc<Daemon>, req: Request<Incoming>) -> Result<Response
 	let response = match allowed(&req) {
 		Err(e) => Err(e),
 		Ok(()) if req.uri().path() == "/socket" => open_socket(daemon, req),
+		Ok(()) if req.uri().path() == "/play" => open_play(daemon, req),
 		Ok(()) => handle(daemon, req).await.map(Reply::response),
 	};
 	Ok(response.unwrap_or_else(|e| {
@@ -745,6 +801,8 @@ pub fn serve() -> Result<(), Error> {
 	if !std::io::stdout().is_terminal() {
 		crate::log::to_file();
 	}
+	events::rolls_over();
+	std::thread::spawn(crate::writeback::prune_backups);
 	let daemon = Arc::new(Daemon::default());
 	daemon.refresh_registry();
 	let _registry = watch_registry(daemon.clone()).map_err(|e| Error(format!("watch {}: {e}", STATE_DIR.display())))?;
@@ -756,12 +814,13 @@ async fn listen(daemon: Arc<Daemon>) -> Result<(), Error> {
 	let listener = match TcpListener::bind(("127.0.0.1", *PORT)).await {
 		Ok(listener) => listener,
 		Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-			log!("port {} is in use: another studio-sync is running. `studio-sync restart`.", *PORT);
+			log!("port {} is in use: another studio-sync is running. `studio-sync install`.", *PORT);
 			std::process::exit(1);
 		}
 		Err(e) => return Err(Error(e.to_string())),
 	};
 	log!("studio-sync {VERSION} serving on http://localhost:{} (pid {})", *PORT, std::process::id());
+	events::record("daemon", json!({ "version": VERSION, "pid": std::process::id() }));
 	loop {
 		let Ok((stream, _)) = listener.accept().await else { continue };
 		let daemon = daemon.clone();

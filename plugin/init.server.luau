@@ -4,6 +4,23 @@ local RunService = game:GetService("RunService")
 local Selection = game:GetService("Selection")
 
 if not RunService:IsEdit() then
+	-- Play is a copy of Edit that a sync doesn't reach. Its client says so, for `studio-sync wait`:
+	-- only the client keeps the place's name, which is how a copy knows its session (the server is
+	-- named "Game"). Nothing here may get in the way of Play.
+	if RunService:IsClient() then
+		local socket
+		task.spawn(function()
+			local ok, opened = pcall(function()
+				return require(script.Sync).announcePlay()
+			end)
+			socket = if ok then opened else nil
+		end)
+		plugin.Unloading:Connect(function()
+			if socket then
+				pcall(socket.Close, socket)
+			end
+		end)
+	end
 	return
 end
 

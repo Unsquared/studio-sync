@@ -3,7 +3,7 @@
 // file built from the project plus that snapshot, so what ships is one commit.
 //
 // place/snapshot.json   what was saved: every instance's path and file, each
-//                       service's saved properties and attributes (Rojo's
+//                       service's saved properties and attributes (the
 //                       explicit value form), what couldn't be saved
 // place/<Service>/...   one .rbxm per top-level instance
 
@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
+use std::process::{Command, Stdio};
 
 // The project file's tree as the plugin needs it: which instances the files own.
 pub fn plan(dir: &Path, config: &Config) -> Res<Value> {
@@ -131,7 +131,6 @@ pub fn commit(uploads: &mut Uploads, project_dir: &Path, name: &str, config: &Co
 		entries.push(json!({ "path": entry.path, "className": entry.class_name, "file": slashes(file) }));
 	}
 	let manifest = json!({
-		"createdAt": crate::util::iso_now(),
 		"placeId": report.place_id,
 		"entries": entries,
 		"services": report.services,
@@ -192,7 +191,7 @@ fn merge_under(node: &mut Value, key: &str, extra: &Value) {
 }
 
 // The project tree with the snapshot grafted in. The project's own entries win.
-fn build_project(dir: &Path, config: &Config, options: &BuildOptions, notes: &mut Vec<String>) -> Res<(Value, PathBuf)> {
+pub fn build_project(dir: &Path, config: &Config, options: &BuildOptions, notes: &mut Vec<String>) -> Res<(Value, PathBuf)> {
 	let project_file = dir.join(&config.project);
 	let mut project = read_json(&project_file)?;
 	let base = project_file.parent().unwrap_or(dir).to_path_buf();
@@ -222,7 +221,7 @@ fn build_project(dir: &Path, config: &Config, options: &BuildOptions, notes: &mu
 			let file = item["file"].as_str().unwrap_or_default();
 			node[leaf.as_str()] = json!({ "$path": slashes(&rel_dir.join(file)) });
 		}
-		notes.push(format!("snapshot from {}: {} instance(s)", manifest["createdAt"].as_str().unwrap_or("?"), entries.len()));
+		notes.push(format!("snapshot: {} instance(s)", entries.len()));
 	} else if options.snapshot {
 		notes.push(format!("no snapshot in {}/ (studio-sync snapshot): code only", config.snapshot_dir()));
 	}
@@ -255,20 +254,15 @@ pub fn run(command: &str, args: &[&str], cwd: &Path) -> Res<String> {
 	Ok(stdout)
 }
 
-// The project with the snapshot grafted in, built by Rojo. Service settings a plugin
+// The project with the snapshot grafted in. Service settings a plugin
 // can't read (Workspace.SignalBehavior, Lighting.Technology, ...) come from the
 // project file's $properties, which win over the snapshot's.
 pub fn build(dir: &Path, config: &Config, options: &BuildOptions) -> Res<Vec<String>> {
 	let mut notes = Vec::new();
-	let (project, base) = build_project(dir, config, options, &mut notes)?;
+	let (project, _) = build_project(dir, config, options, &mut notes)?;
 	let output = dir.join(&options.output);
 	mkdirs(output.parent().unwrap_or(dir))?;
-	// written next to the project file so every $path resolves the same way
-	let temp = base.join(format!(".studio-sync-build-{}.project.json", process::id()));
-	write(&temp, tabbed(&project)?)?;
-	let built = run("rojo", &["build", &temp.to_string_lossy(), "-o", &output.to_string_lossy()], dir);
-	remove(&temp)?;
-	built?;
+	crate::build::place(dir, &config.project, &project, &output, &mut notes)?;
 	notes.push(format!("built {}", options.output.display()));
 	Ok(notes)
 }

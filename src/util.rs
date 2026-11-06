@@ -131,6 +131,10 @@ pub fn stamp() -> String {
 	chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S-%3fZ").to_string()
 }
 
+pub fn now_ms() -> u64 {
+	chrono::Utc::now().timestamp_millis().max(0) as u64
+}
+
 pub fn iso_now() -> String {
 	chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }

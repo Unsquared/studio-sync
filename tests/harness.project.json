@@ -1,0 +1,10 @@
+{
+	"name": "harness",
+	"tree": {
+		"$className": "DataModel",
+		"ServerStorage": {
+			"SyncUnderTest": { "$path": "../plugin/Sync.luau" },
+			"SyncHarness": { "$path": "plugin_harness.luau" }
+		}
+	}
+}

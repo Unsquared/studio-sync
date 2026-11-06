@@ -53,6 +53,11 @@ pub fn log_file() -> PathBuf {
 	}
 }
 
+// What happened, for later analysis (events.rs)
+pub fn events_file() -> PathBuf {
+	STATE_DIR.join("events.jsonl")
+}
+
 pub fn local_app_data() -> PathBuf {
 	env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| home().join("AppData").join("Local"))
 }

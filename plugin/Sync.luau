@@ -13,6 +13,9 @@
 	  has an unsaved edit of that model. Scripts are edited on disk: a Studio
 	  edit is not saved, and the next disk change replaces it.
 
+	A `studio-sync wait` also asks whether Studio still holds what the sync gave
+	it: what is gone comes back with a full sync, and text that differs is reported.
+
 	Other instances (Parts, models, values) made in Studio are saved with
 	Sync.pull (the toolbar's "Save to disk", or `studio-sync pull` from a shell);
 	after that they are synced models too.
@@ -31,7 +34,8 @@ local HttpService = game:GetService("HttpService")
 local ScriptEditorService = game:GetService("ScriptEditorService")
 local SerializationService = game:GetService("SerializationService")
 
-local PLUGIN_VERSION = "3.1.0"
+local PLUGIN_VERSION = "3.2.0"
+local PLAY_NAME_SECONDS = 30
 local DEFAULT_URL = "http://localhost:34999"
 local RETRY_OFFLINE = 3
 local RETRY_UNKNOWN = 6
@@ -73,12 +77,16 @@ local function warnOnce(s, key: string, message: string)
 	s.log(`[studio-sync] {message}`)
 end
 
+local function copySession(placeName: string): string?
+	return string.match(placeName, "%-copy%-(%x+)%.rbxl$")
+end
+
 function Sync.new(options: { [string]: any })
 	return {
 		base = options.base or DEFAULT_URL,
 		placeId = options.placeId or game.PlaceId,
 		-- a copy made by `studio-sync open --copy` is the file <checkout>-copy-<session>.rbxl
-		session = options.session or string.match(game.Name, "%-copy%-(%x+)%.rbxl$"),
+		session = options.session or copySession(game.Name),
 		clientId = HttpService:GenerateGUID(false),
 		log = options.log or print,
 		onStatus = options.onStatus,
@@ -102,6 +110,12 @@ function Sync.new(options: { [string]: any })
 		dirtyModels = {}, -- key -> os.clock() of the model's last edit
 		saveScheduled = false,
 		saving = false, -- a model save is in flight
+		applying = false, -- a full sync or a delta is being applied
+		fullWanted = false, -- a check found Studio lost something: the loop does a full sync
+		nodeErrors = {}, -- key -> { string }: what the node's last apply reported
+		otherErrors = {}, -- what the last full sync reported about anything else
+		failed = {}, -- key -> node: nodes whose apply threw (a failed download): retried at a flush
+		lastDisconnect = nil,
 		loaded = {}, -- key -> true: models loaded from their files, whose Studio version is not recorded yet
 		connections = {},
 		warned = {},
@@ -439,6 +453,13 @@ end
 
 local function forget(s, path: { string })
 	local prefix = keyOf(path)
+	for _, byKey in { s.nodeErrors, s.failed } do
+		for key in byKey do
+			if key == prefix or string.sub(key, 1, #prefix + 1) == prefix .. SEP then
+				byKey[key] = nil
+			end
+		end
+	end
 	for key, entry in s.known do
 		if key == prefix or string.sub(key, 1, #prefix + 1) == prefix .. SEP then
 			s.known[key] = nil
@@ -580,6 +601,23 @@ local function applyNode(s, node: any, counts: Counts, errors: { string }, kept:
 	return instance, node
 end
 
+-- Applies one node and keeps what it reported until that node next applies: a later delta of
+-- other files must not make a failure look fixed. Returns the instance and the node to remember.
+local function applyOne(s, node: any, counts: Counts, kept: { string }?): (Instance?, any)
+	local key = keyOf(node.path)
+	local errors = {}
+	local ok, result, effective = pcall(applyNode, s, node, counts, errors, kept)
+	if not ok then
+		table.insert(errors, `{display(node.path)}: {result}`)
+	end
+	s.failed[key] = if ok then nil else node
+	s.nodeErrors[key] = if #errors > 0 then errors else nil
+	if ok then
+		return result, effective
+	end
+	return nil, nil
+end
+
 local function byDepth(a: any, b: any): boolean
 	return #a.path < #b.path
 end
@@ -595,13 +633,25 @@ local function sendReport(s)
 	send(s, { type = "report", errors = s.errors })
 end
 
-local function report(s, errors: { string })
-	if #errors == 0 and #s.errors == 0 then
+-- Tells the daemon what is wrong now, when that changed.
+local function report(s)
+	local errors = table.clone(s.otherErrors)
+	for _, list in s.nodeErrors do
+		table.move(list, 1, #list, #errors + 1, errors)
+	end
+	table.sort(errors)
+	if table.concat(errors, "\n") == table.concat(s.errors, "\n") then
 		return
+	end
+	local before = {}
+	for _, err in s.errors do
+		before[err] = true
 	end
 	s.errors = errors
 	for _, err in errors do
-		s.log(`[studio-sync] {err}`)
+		if not before[err] then
+			s.log(`[studio-sync] {err}`)
+		end
 	end
 	sendReport(s)
 end
@@ -670,6 +720,45 @@ local function unhookAll(s)
 	s.connections = {}
 end
 
+-- A tag change fires no Changed on its instance, only these signals. It is a model edit too.
+local function watchTags(s)
+	local function tagEdited(instance: Instance)
+		local at: Instance? = instance
+		while at do
+			local key = s.byInstance[at]
+			local hooks = key and s.modelHooks[key]
+			if hooks then
+				if hooks.armed and hooks.instance == at then
+					modelEdited(s, key)
+				end
+				return
+			end
+			at = at.Parent
+		end
+	end
+	local watched = {}
+	local function watch(tag: string)
+		if not watched[tag] then
+			watched[tag] = true
+			table.insert(s.connections, CollectionService:GetInstanceAddedSignal(tag):Connect(tagEdited))
+			table.insert(s.connections, CollectionService:GetInstanceRemovedSignal(tag):Connect(tagEdited))
+		end
+	end
+	for _, tag in CollectionService:GetAllTags() do
+		watch(tag)
+	end
+	-- a new tag's first instance was tagged before its signals could be connected
+	table.insert(
+		s.connections,
+		CollectionService.TagAdded:Connect(function(tag: string)
+			watch(tag)
+			for _, instance in CollectionService:GetTagged(tag) do
+				tagEdited(instance)
+			end
+		end)
+	)
+end
+
 -- Scripts sync one way: an edit in Studio's editor gets a warning, once per script.
 local function watchEditor(s)
 	for _, connection in s.connections do
@@ -694,16 +783,18 @@ end
 
 -- -- full sync ---------------------------------------------------------------------
 
-local function applyFull(s, data: any): (Counts, { string })
+local function applyFull(s, data: any): Counts
 	local counts = { created = 0, updated = 0, removed = 0 }
 	local errors = {}
+	s.nodeErrors, s.failed = {}, {}
 	local nodes = data.nodes
 	table.sort(nodes, byDepth)
 
-	-- Studio text that disk is about to replace is backed up first
+	-- Studio text that disk is about to replace is backed up first. A module generated from a
+	-- .json or .txt is no work: the file holds it all.
 	local items = {}
 	for _, node in nodes do
-		if node.source then
+		if node.source and node.kind ~= "generated" then
 			local existing = find(node.path)
 			if existing and isScript(existing) then
 				local text = currentText(existing)
@@ -726,10 +817,8 @@ local function applyFull(s, data: any): (Counts, { string })
 	local wanted: { [Instance]: boolean } = {}
 	local kept = {}
 	for _, node in nodes do
-		local ok, result, effective = pcall(applyNode, s, node, counts, errors, kept)
-		if not ok then
-			table.insert(errors, `{display(node.path)}: {result}`)
-		elseif result then
+		local result, effective = applyOne(s, node, counts, kept)
+		if result then
 			wanted[result] = true
 			remember(s, effective, result)
 			if node.kind == "model" then
@@ -807,12 +896,13 @@ local function applyFull(s, data: any): (Counts, { string })
 	recordLoads(s)
 	s.epoch, s.version, s.roots, s.name = data.epoch, data.version, data.roots, data.name
 	watchEditor(s)
-	return counts, errors
+	watchTags(s)
+	s.otherErrors = errors
+	return counts
 end
 
-local function applyDelta(s, data: any): (Counts, { string })
+local function applyDelta(s, data: any): Counts
 	local counts = { created = 0, updated = 0, removed = 0 }
-	local errors = {}
 	for _, path in data.removes do
 		local entry = s.known[keyOf(path)]
 		local instance = if entry and entry.instance.Parent then entry.instance else find(path)
@@ -843,10 +933,8 @@ local function applyDelta(s, data: any): (Counts, { string })
 		)
 	end
 	for _, node in data.upserts do
-		local ok, result, effective = pcall(applyNode, s, node, counts, errors)
-		if not ok then
-			table.insert(errors, `{display(node.path)}: {result}`)
-		elseif result then
+		local result, effective = applyOne(s, node, counts)
+		if result then
 			remember(s, effective, result)
 		end
 	end
@@ -855,7 +943,18 @@ local function applyDelta(s, data: any): (Counts, { string })
 	if data.writeback ~= nil then
 		s.writeback = data.writeback and s.writebackEnabled
 	end
-	return counts, errors
+	return counts
+end
+
+-- Runs a full sync or a delta. A check of what Studio holds waits for it to end.
+local function applying(s, apply: (any, any) -> Counts, data: any): Counts
+	s.applying = true
+	local ok, counts = pcall(apply, s, data)
+	s.applying = false
+	if not ok then
+		error(counts, 0)
+	end
+	return counts
 end
 
 -- -- pull: save any instance as a model file -------------------------------------------
@@ -1074,19 +1173,19 @@ function recordLoads(s)
 	s.saving = wasSaving
 end
 
--- Saves the models that have been quiet for MODEL_DEBOUNCE, one at a time.
-function saveModels(s)
+-- Saves the models that have been quiet for MODEL_DEBOUNCE (`now`: every edited one), one at a time.
+function saveModels(s, now: boolean?)
 	s.saveScheduled = false
 	if s.saving then
 		s.saveScheduled = true
 		task.delay(MODEL_DEBOUNCE, saveModels, s)
 		return
 	end
-	local now, soonest = os.clock(), nil
+	local clock, soonest = os.clock(), nil
 	local due = {}
 	for key, at in s.dirtyModels do
-		local left = MODEL_DEBOUNCE - (now - at)
-		if left > 0 then
+		local left = MODEL_DEBOUNCE - (clock - at)
+		if left > 0 and not now then
 			soonest = math.min(soonest or left, left)
 		else
 			table.insert(due, key)
@@ -1251,6 +1350,77 @@ local function closeSocket(s)
 	ring(s)
 end
 
+local function settled(s)
+	while s.saving or s.applying do
+		task.wait()
+	end
+end
+
+-- A `wait` asks: every model edit goes to its file now, without the quiet time, and a node whose
+-- apply failed gets another try.
+local function flushModels(s, seq: number)
+	settled(s)
+	saveModels(s, true)
+	if next(s.failed) then
+		s.applying = true
+		local counts = { created = 0, updated = 0, removed = 0 }
+		for _, node in s.failed do
+			local result, effective = applyOne(s, node, counts)
+			if result then
+				remember(s, effective, result)
+			end
+		end
+		recordLoads(s)
+		s.applying = false
+		report(s)
+	end
+	send(s, { type = "flushed", seq = seq })
+end
+
+local CHECK_NAMES = 20
+
+-- At most CHECK_NAMES names, sorted, and how many more there are.
+local function capped(names: { string }): { string }
+	table.sort(names)
+	if #names <= CHECK_NAMES then
+		return names
+	end
+	local shown = table.move(names, 1, CHECK_NAMES, 1, {})
+	table.insert(shown, `...and {#names - CHECK_NAMES} more`)
+	return shown
+end
+
+-- A `wait` asks, after all is applied: does Studio still hold what the sync gave it? An undo, a
+-- script or a person can remove, move or change it, and no file event tells. What is gone comes
+-- back with a full sync. Script text that differs is reported, not replaced: it may be someone's
+-- work, and `studio-sync wait --full` replaces it (with a backup).
+local function verify(s, seq: number)
+	settled(s)
+	local open = {}
+	local ok, documents = pcall(ScriptEditorService.GetScriptDocuments, ScriptEditorService)
+	for _, document in if ok then documents else {} do
+		local scriptOk, script = pcall(document.GetScript, document)
+		if scriptOk and script then
+			open[script] = document:GetText()
+		end
+	end
+	local missing, edited = {}, {}
+	for _, entry in s.known do
+		if find(entry.path) ~= entry.instance then
+			table.insert(missing, display(entry.path))
+		elseif entry.source and isScript(entry.instance) then
+			if (open[entry.instance] or (entry.instance :: any).Source) ~= entry.source then
+				table.insert(edited, display(entry.path))
+			end
+		end
+	end
+	send(s, { type = "verified", seq = seq, missing = capped(missing), edited = capped(edited) })
+	if #missing > 0 then
+		s.fullWanted = true
+		ring(s)
+	end
+end
+
 local function onMessage(s, text: string)
 	local ok, message = pcall(HttpService.JSONDecode, HttpService, text)
 	if not ok or type(message) ~= "table" then
@@ -1261,6 +1431,10 @@ local function onMessage(s, text: string)
 		ring(s)
 	elseif message.type == "snapshot" or message.type == "pull" then
 		task.spawn(runCommand, s, message)
+	elseif message.type == "flush" then
+		task.spawn(flushModels, s, message.seq)
+	elseif message.type == "verify" then
+		task.spawn(verify, s, message.seq)
 	end
 end
 
@@ -1291,9 +1465,14 @@ local function openSocket(s): boolean
 			ring(s)
 		end
 	end)
+	-- the daemon speaks as soon as the socket opens, before the wait below ends: a version newer
+	-- than the tree (a model that a full sync just saved) must not be lost
+	local early = {}
 	socket.MessageReceived:Connect(function(text: string)
 		if s.socket == socket then
 			onMessage(s, text)
+		elseif not s.socket then
+			table.insert(early, text)
 		end
 	end)
 	local deadline = os.clock() + 10
@@ -1306,6 +1485,9 @@ local function openSocket(s): boolean
 	end
 	s.socket = socket
 	s.latest = { epoch = s.epoch, version = s.version }
+	for _, text in early do
+		onMessage(s, text)
+	end
 	sendReport(s)
 	return true
 end
@@ -1327,8 +1509,8 @@ function Sync.connect(s): (string?, string?)
 	if status ~= 200 then
 		return nil, `daemon answered {status}: {body}`
 	end
-	local counts, errors = applyFull(s, HttpService:JSONDecode(body))
-	report(s, errors)
+	local counts = applying(s, applyFull, HttpService:JSONDecode(body))
+	report(s)
 	return summary(counts)
 end
 
@@ -1353,8 +1535,8 @@ function Sync.poll(s): string?
 	while s.saving do
 		task.wait()
 	end
-	local counts, errors = applyDelta(s, data)
-	report(s, errors)
+	local counts = applying(s, applyDelta, data)
+	report(s)
 	send(s, { type = "applied", version = s.version })
 	return summary(counts)
 end
@@ -1375,6 +1557,7 @@ end
 
 local function cycle(s)
 	if s.status ~= "connected" then
+		local started = os.clock()
 		local line, reason = Sync.connect(s)
 		if line and not openSocket(s) then
 			line, reason = nil, "offline"
@@ -1390,6 +1573,12 @@ local function cycle(s)
 		setStatus(s, "connected")
 		local mode = if s.writeback then "models save back" else "disk -> Studio only"
 		s.log(`[studio-sync] connected: {s.name} v{s.version}, {mode} ({line})`)
+		send(s, {
+			type = "event",
+			name = "synced",
+			detail = { seconds = os.clock() - started, result = line, lastDisconnect = s.lastDisconnect },
+		})
+		s.lastDisconnect = nil
 		return
 	end
 	waitForRing(s)
@@ -1398,6 +1587,16 @@ local function cycle(s)
 	end
 	if not s.socket then
 		error("the daemon closed the connection")
+	end
+	if s.fullWanted then
+		s.fullWanted = false
+		local line, reason = Sync.connect(s)
+		if not line then
+			error(`full sync: {reason}`)
+		end
+		send(s, { type = "applied", version = s.version })
+		s.log(`[studio-sync] something the sync made was gone from Studio: resynced v{s.version} ({line})`)
+		return
 	end
 	local latest = s.latest
 	if latest.epoch == s.epoch and latest.version <= s.version then
@@ -1429,6 +1628,7 @@ function Sync.run(s)
 			if not ok and not s.stopped and not s.paused then
 				if s.status == "connected" then
 					s.log(`[studio-sync] disconnected ({err})`)
+					s.lastDisconnect = tostring(err)
 				end
 				closeSocket(s)
 				setStatus(s, "offline")
@@ -1442,6 +1642,31 @@ function Sync.start(options)
 	local s = Sync.new(options)
 	task.spawn(Sync.run, s)
 	return s
+end
+
+-- In a Play client: holds a socket open while Play runs, so the daemon can tell `wait` that it
+-- started before the current version. Quiet if it can't: Play must work without the daemon.
+function Sync.announcePlay(options: { [string]: any }?): any
+	local options = table.clone(options or {})
+	-- A copy's Play client gets the place's name a moment after plugins start.
+	local placeName = options.placeName or function()
+		return game.Name
+	end
+	local deadline = os.clock() + PLAY_NAME_SECONDS
+	while
+		not options.session
+		and (options.placeId or game.PlaceId) == 0
+		and not copySession(placeName())
+		and os.clock() < deadline
+	do
+		task.wait(0.25)
+	end
+	options.session = options.session or copySession(placeName())
+	local s = Sync.new(options)
+	local ok, socket = pcall(function()
+		return HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, { Url = socketUrl(s, "/play") })
+	end)
+	return if ok then socket else nil
 end
 
 Sync.VERSION = PLUGIN_VERSION

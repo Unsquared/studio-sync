@@ -1,10 +1,18 @@
 [package]
 name = "studio-sync"
-version = "3.1.0"
+version = "3.2.0"
+license = "MIT"
 edition = "2024"
-description = "Two-way sync between Roblox Studio and a Rojo project, built for agents: an always-on daemon plus a Studio plugin"
+description = "Two-way sync between Roblox Studio and your files, built for agents: an always-on daemon plus a Studio plugin"
 
 [dependencies]
+csv = "1"
+rbx_binary = "3"
+rbx_dom_weak = "4"
+rbx_reflection = "7"
+rbx_reflection_database = "3"
+rbx_xml = "3"
+toml = "0.9"
 base64 = "0.23.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }

@@ -1,44 +1,36 @@
 # studio-sync
 
-Sync between Roblox Studio and a Rojo project, for coding agents. It replaces `rojo serve`.
+Keeps Roblox Studio and your files in sync, so coding agents can work in a Roblox game from its repo. It replaces `rojo serve` and `rojo build`, and uses the same file layout (`default.project.json`), but you don't need Rojo.
 
-- Files go to Studio in less than one second. Code is edited on disk; models (`.rbxm`) edited in Studio save back to their files.
-- `snapshot` saves the whole place (maps, UI, lighting) into the repo. `build` makes a place file to publish.
-- `open --copy` gives each agent its own private copy of the place.
+- **Code goes from files to Studio** in under a second.
+- **Models go both ways:** edit a model in Studio and its `.rbxm` file updates, change the file and Studio updates.
+- **Each agent can have its own copy of the place,** so agents in different worktrees don't get in each other's way.
+- **Nothing is lost:** whatever a sync overwrites or deletes is backed up first.
 
-Agents: read [`skill/SKILL.md`](skill/SKILL.md). It has the full workflow.
+If you're an agent, read [`skill/SKILL.md`](skill/SKILL.md). `studio-sync install` also installs it as a Claude skill.
 
 ## Install
 
-With [rokit](https://github.com/rojo-rbx/rokit), once on each machine:
+Once on each machine, with [rokit](https://github.com/rojo-rbx/rokit):
 
 ```bash
 rokit add --global Unsquared/studio-sync
 studio-sync install
 ```
 
-`install` starts the background daemon (one for all projects, so install it globally, not per repo) and writes the Studio plugin and the agent skill, which the binary carries. Live sync reads the Rojo project file itself; only `build` and `open --copy` run `rojo` (rokit, in the project).
+`install` sets up the Studio plugin, the agent skill and a background daemon that serves all your projects. When Studio asks to allow HTTP for "Studio Sync", allow it. Don't connect the Rojo plugin to a synced place.
 
-When Studio asks to allow HTTP for "Studio Sync", allow it. Do not connect the Rojo plugin to synced places.
+To update, run `studio-sync install --update`, then restart Studio. This restarts the daemon, so it refuses while a Studio is connected. `--force` goes ahead, and each Studio does a full sync.
 
-To update, run `rokit update --global studio-sync && studio-sync install`, then restart Studio.
+## Set up a project
 
-Then, in each project, run `studio-sync add` and put your dev place id in `studio-sync.json`.
+In the project's folder:
 
-## Commands
+```bash
+studio-sync add
+```
 
-| | |
-|---|---|
-| `add` / `remove` / `claim` | register a project / unregister it / make this checkout sync its places (worktrees) |
-| `status` / `log` | show what syncs, errors, and the daemon log |
-| `wait` | wait until Studio has every file change (exit 0 in sync, 2 no Studio, 3 errors, 4 timeout) |
-| `pull <Instance.Path> [file]` | save one Studio instance as `.rbxm` (`--from <session or placeId>` when several Studios are connected) |
-| `snapshot` | save the whole open place, except code, into `place/` (`--from` as for `pull`) |
-| `build` | make `build/place.rbxl` from code + snapshot |
-| `open` / `open --copy` / `close` | open the dev place / open a private copy / close the copies |
-| `install` / `restart` / `serve` | machine setup |
-
-## `studio-sync.json`
+Then put your dev place id in the `studio-sync.json` it writes:
 
 ```json
 {
@@ -48,15 +40,53 @@ Then, in each project, run `studio-sync add` and put your dev place id in `studi
 }
 ```
 
-`roots` are the paths that sync. `studio-sync.local.json` (not in git) overrides keys for one person, for example their own `placeIds`. All keys and the sync behavior: [`docs/config.md`](docs/config.md).
+`roots` are the paths that sync. To use your own place id without changing it for everyone, put it in `studio-sync.local.json` and keep that file out of git. [`docs/config.md`](docs/config.md) lists every setting.
 
-## Rules
+Use a dev place, never the live place.
 
-- **Disk wins for code; for models, the side that changed wins.** Script edits in Studio are not saved. On a connect, a model file changed by a `git pull` loads in Studio, and a model edited in Studio is saved over its file. If both changed, Studio wins and the file goes to backups.
-- **Connect makes Studio's code match the disk.** Under the roots, Studio-only scripts and instances are removed.
-- **Nothing is lost.** The tool copies all that it overwrites or deletes to `~/.config/studio-sync/backups/`.
-- **One syncer for each place.** Use your own dev place, never the live place.
+## Daily use
+
+1. Open the place with `studio-sync open`, or a private copy with `studio-sync open --copy`.
+2. Edit your files.
+3. Run `studio-sync wait` before you test. It returns once Studio has your changes, or tells you what's wrong.
+4. Run `studio-sync close` when you're done with a copy.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `wait` | Applies file edits to Studio, saves its model edits, and checks what Studio holds. Exit code: 0 in sync, 2 no Studio, 3 errors or differences, 4 timeout |
+| `status` | Shows connected Studios, copies and errors |
+| `changes [file]` | Shows what happened that git doesn't, in a few short lines. For an `.rbxm`, also what differs from git's version |
+| `open [--copy]` | Opens the dev place and makes this checkout the one that syncs it, or opens a private copy |
+| `close` | Closes this checkout's copies |
+| `pull <path> [file]` | Saves a Studio instance as `.rbxm` |
+| `snapshot` | Saves the whole open place, except code, to `place/` |
+| `build [-o file]` | Builds a place file from code and the snapshot, by default `build/place.rbxl` |
+| `add` | Sets up a project here. Deleting its `studio-sync.json` or its folder unregisters it |
+| `install` | Sets up this machine and restarts the daemon. `--update` gets the new version first, `--remove` undoes it |
+
+`studio-sync <command> --help` shows the flags.
+
+## What wins
+
+- **Code: the disk wins.** Script edits made in Studio aren't saved to files. The next sync replaces them, and their text goes to backups.
+- **Models: the side that changed wins.** If both changed, Studio wins and the old file goes to backups.
+- **Connecting makes Studio's code match the disk.** Under the roots, scripts and instances that exist only in Studio are removed, after a backup.
+- **One checkout syncs each place.** If another checkout's Studio is on the place, `open` refuses. `--force` switches that Studio over. To test a worktree, use `open --copy`.
+
+Backups are in `~/.config/studio-sync/backups/` and stay for 30 days.
 
 ## Develop
 
-From a checkout: `cargo install --path . && studio-sync install` runs your build. Run `cargo clippy --all-targets` and `cargo test`. A tag `v<version>` (the version in Cargo.toml) publishes the release binaries. [`CLAUDE.md`](CLAUDE.md) has the contributor rules. [`docs/protocol.md`](docs/protocol.md) has the HTTP and WebSocket protocol. Windows is not tested yet: see the checklist in `CLAUDE.md`.
+```bash
+cargo install --path . && studio-sync install
+cargo clippy --all-targets
+cargo test
+```
+
+A tag `v<version>`, matching the version in `Cargo.toml`, publishes the release binaries. [`CLAUDE.md`](CLAUDE.md) has the contributor rules, and [`docs/protocol.md`](docs/protocol.md) has the HTTP and WebSocket protocol.
+
+## License
+
+[MIT](LICENSE)

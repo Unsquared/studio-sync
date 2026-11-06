@@ -1,5 +1,5 @@
 // Installing studio-sync on this machine: the Studio plugin (an .rbxmx written
-// straight from plugin/, no Rojo needed), the background service (a macOS
+// straight from plugin/, no other tool needed), the background service (a macOS
 // LaunchAgent, or a Windows Startup-folder launcher), and the Claude Code skill.
 
 use crate::paths::{LABEL, LEGACY_LABELS, home, log_file, plugin_dir};
@@ -15,6 +15,7 @@ use std::time::Duration;
 pub const SYNC_SOURCE: &str = include_str!("../plugin/Sync.luau");
 const MAIN_SOURCE: &str = include_str!("../plugin/init.server.luau");
 const SKILL: &str = include_str!("../skill/SKILL.md");
+const CONFIG_DOC: &str = include_str!("../docs/config.md");
 
 fn plugin_file() -> PathBuf {
 	plugin_dir().join("StudioSync.rbxmx")
@@ -192,22 +193,6 @@ fn uninstall_service() -> Res<()> {
 	Ok(())
 }
 
-pub fn restart_service(pid: Option<u32>) -> String {
-	if cfg!(target_os = "macos") && plist_path(LABEL).exists() {
-		launchctl(&["kickstart", "-k", &format!("{}/{LABEL}", domain())]);
-		return "restarted the LaunchAgent".into();
-	}
-	let Some(pid) = pid else { return "no daemon running".into() };
-	let pid = sysinfo::Pid::from_u32(pid);
-	if let Ok(mut system) = sysinfo::System::new() {
-		system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-		if let Some(process) = system.process(pid) {
-			process.kill_with(sysinfo::Signal::Term).unwrap_or_else(|| process.kill());
-		}
-	}
-	if cfg!(windows) { "stopped the daemon; its launcher starts it again in 3 s".into() } else { format!("stopped pid {pid}") }
-}
-
 fn skill_dir() -> PathBuf {
 	home().join(".claude").join("skills").join("studio-sync")
 }
@@ -238,6 +223,7 @@ fn install_skill() -> Res<String> {
 	mkdirs(&dir)?;
 	let file = dir.join("SKILL.md");
 	write(&file, SKILL)?;
+	write(&dir.join("config.md"), CONFIG_DOC)?;
 	Ok(file.display().to_string())
 }
 
@@ -247,7 +233,50 @@ fn uninstall_skill() -> Res<()> {
 		return fs::remove_file(&dir).or_else(|_| fs::remove_dir(&dir)).map_err(|e| Error(format!("{}: {e}", dir.display())));
 	}
 	remove(&dir.join("SKILL.md"))?;
+	remove(&dir.join("config.md"))?;
 	let _ = fs::remove_dir(&dir); // only when nothing else is in it
+	Ok(())
+}
+
+// Where a link to the command goes on macOS: a shell that reads no ~/.zshrc, as an agent's often
+// doesn't, finds it here, and not in ~/.cargo/bin.
+fn link_dirs() -> [PathBuf; 3] {
+	[PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin"), home().join(".local").join("bin")]
+}
+
+#[cfg(unix)]
+fn link_command() -> Res<Option<String>> {
+	let exe = binary()?;
+	if !cfg!(target_os = "macos") || link_dirs().iter().any(|dir| exe.parent() == Some(dir)) {
+		return Ok(None);
+	}
+	for dir in link_dirs().iter().filter(|dir| dir.is_dir()) {
+		let link = dir.join("studio-sync");
+		if link.exists() && !is_link(&link) {
+			continue; // not ours
+		}
+		if is_link(&link) && fs::remove_file(&link).is_err() {
+			continue;
+		}
+		if std::os::unix::fs::symlink(&exe, &link).is_ok() {
+			return Ok(Some(format!("command: {} -> {}", link.display(), exe.display())));
+		}
+	}
+	Ok(None)
+}
+
+#[cfg(not(unix))]
+fn link_command() -> Res<Option<String>> {
+	Ok(None)
+}
+
+fn unlink_command() -> Res<()> {
+	let exe = binary()?;
+	for link in link_dirs().iter().map(|dir| dir.join("studio-sync")) {
+		if fs::read_link(&link).is_ok_and(|target| target == exe) {
+			remove(&link)?;
+		}
+	}
 	Ok(())
 }
 
@@ -259,15 +288,41 @@ fn on_path(program: &str) -> bool {
 
 pub fn install() -> Res<Vec<String>> {
 	let mut lines = Vec::new();
-	if !on_path("rojo") {
-		lines.push("note: `rojo` is not on PATH here; `build` and `open --copy` need it (rokit install in the project)".into());
-	}
 	lines.push(format!("plugin: {} (Studio picks it up on its next start, often live)", build_plugin()?.display()));
 	lines.push(format!("service: {}", install_service()?));
 	lines.push(format!("Claude skill: {}", install_skill()?));
-	if !on_path("studio-sync") {
+	let linked = link_command()?;
+	lines.extend(linked.clone());
+	if linked.is_none() && !on_path("studio-sync") {
 		lines.push("the `studio-sync` command is not on PATH yet: `rokit add --global Unsquared/studio-sync`".into());
 	}
+	Ok(lines)
+}
+
+// Installs the new binary the way this one got here, then has the new one run `install`: the old
+// one carries the old plugin and skill.
+pub fn update() -> Res<Vec<String>> {
+	let exe = binary()?;
+	let from_rokit = exe.components().any(|c| c.as_os_str() == ".rokit");
+	let in_checkout = fs::read_to_string("Cargo.toml").is_ok_and(|manifest| manifest.contains("name = \"studio-sync\""));
+	let (program, args): (&str, &[&str]) = if from_rokit {
+		("rokit", &["update", "--global", "studio-sync"])
+	} else if in_checkout {
+		("cargo", &["install", "--path", ".", "--locked"])
+	} else {
+		("cargo", &["install", "--git", "https://github.com/Unsquared/studio-sync", "--locked"])
+	};
+	let mut lines = vec![format!("{program} {}", args.join(" "))];
+	let run = |command: &mut Command, what: &str| -> Res<()> {
+		let status = command.status().map_err(|e| Error(format!("{what}: {e}")))?;
+		if !status.success() {
+			crate::bail!("{what} failed ({status}); nothing else changed");
+		}
+		Ok(())
+	};
+	run(Command::new(program).args(args), program)?;
+	run(Command::new(&exe).arg("install"), "the new binary's install")?;
+	lines.push("updated. A Studio that `status` flags needs a restart for the new plugin.".into());
 	Ok(lines)
 }
 
@@ -275,5 +330,6 @@ pub fn uninstall() -> Res<Vec<String>> {
 	uninstall_service()?;
 	remove(&plugin_file())?;
 	uninstall_skill()?;
+	unlink_command()?;
 	Ok(vec!["removed the service, the plugin and the skill link (`cargo uninstall studio-sync` removes the command)".into()])
 }

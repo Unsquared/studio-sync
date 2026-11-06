@@ -155,7 +155,8 @@ pub fn default_roots(project: &Value) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
 	(roots, read_only)
 }
 
-// JSON as a Luau table literal, the way Rojo turns a .json file into a ModuleScript.
+// JSON as a Luau table literal: the text of the ModuleScript a .json file is. Rojo's text, so a place
+// it built holds the same.
 pub fn luau_literal(value: &Value) -> String {
 	let mut out = String::new();
 	write_literal(&mut out, value, 0);
@@ -167,25 +168,20 @@ fn write_literal(out: &mut String, value: &Value, depth: usize) {
 	match value {
 		Value::Null => out.push_str("nil"),
 		Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-		Value::Number(n) => match n.as_f64() {
-			Some(f) if n.is_f64() => out.push_str(&f.to_string()),
-			_ => out.push_str(&n.to_string()),
-		},
-		Value::String(_) => out.push_str(&value.to_string()),
-		Value::Array(items) if items.is_empty() => out.push_str("{}"),
-		Value::Object(fields) if fields.is_empty() => out.push_str("{}"),
+		Value::Number(n) => out.push_str(&n.as_f64().unwrap_or_default().to_string()),
+		Value::String(text) => write_string(out, text),
 		Value::Array(items) => {
-			out.push_str("{\n");
-			for item in items {
-				indent(out, depth + 1);
-				write_literal(out, item, depth + 1);
-				out.push_str(",\n");
+			out.push('{');
+			for (index, item) in items.iter().enumerate() {
+				if index > 0 {
+					out.push_str(", ");
+				}
+				write_literal(out, item, depth);
 			}
-			indent(out, depth);
 			out.push('}');
 		}
 		Value::Object(fields) => {
-			// sorted like Rojo's output, so a Rojo-built place and a synced one hold the same text
+			// sorted, so a change of order in the file changes nothing in Studio
 			let mut sorted: Vec<_> = fields.iter().collect();
 			sorted.sort_by(|a, b| a.0.cmp(b.0));
 			out.push_str("{\n");
@@ -202,14 +198,34 @@ fn write_literal(out: &mut String, value: &Value, depth: usize) {
 	}
 }
 
+fn write_string(out: &mut String, text: &str) {
+	out.push('"');
+	for c in text.chars() {
+		match c {
+			'"' => out.push_str("\\\""),
+			'\r' => out.push_str("\\r"),
+			'\n' => out.push_str("\\n"),
+			'\t' => out.push_str("\\t"),
+			'\\' => out.push_str("\\\\"),
+			_ => out.push(c),
+		}
+	}
+	out.push('"');
+}
+
+const KEYWORDS: [&str; 21] = [
+	"and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in", "local", "nil", "not", "or", "repeat", "return",
+	"then", "true", "until", "while",
+];
+
 fn write_field(out: &mut String, key: &str) {
 	let mut chars = key.chars();
 	let ident = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-	if ident {
+	if ident && !KEYWORDS.contains(&key) {
 		out.push_str(key);
 	} else {
 		out.push('[');
-		out.push_str(&Value::String(key.into()).to_string());
+		write_string(out, key);
 		out.push(']');
 	}
 }
@@ -352,7 +368,8 @@ impl Collector<'_> {
 				// a nested project: its instances come through the layout
 			} else if let Some(stem) = base.strip_suffix(".luau").or_else(|| base.strip_suffix(".lua")) {
 				if read {
-					source = Some(self.text(&file)?);
+					// as Rojo builds it: a built copy then holds the same text
+					source = Some(self.text(&file)?.replace("\r\n", "\n"));
 				}
 				if base.starts_with("init.") {
 					kind = Kind::Init;
@@ -384,7 +401,7 @@ impl Collector<'_> {
 				place.file = Some(file);
 			} else if base.ends_with(".toml") || base.ends_with(".csv") {
 				kind = Kind::Generated;
-				error = Some(format!("{}: .toml and .csv files are not synced (rojo build still includes them)", file.display()));
+				error = Some(format!("{}: .toml and .csv files are not synced (`build` still includes them)", file.display()));
 				place.file = Some(file);
 			}
 		}
@@ -452,6 +469,12 @@ impl Collector<'_> {
 mod tests {
 	use super::*;
 	use std::fs;
+
+	#[test]
+	fn literals() {
+		let value = serde_json::json!({ "end": 1, "b c": [1, 2.5, "x\"\n", null, {}], "a": true });
+		assert_eq!(luau_literal(&value), "{\n\ta = true,\n\t[\"b c\"] = {1, 2.5, \"x\\\"\\n\", nil, {\n\t}},\n\t[\"end\"] = 1,\n}");
+	}
 
 	fn write(dir: &Path, rel: &str, text: &str) {
 		let file = dir.join(rel);

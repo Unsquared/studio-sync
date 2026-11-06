@@ -22,11 +22,28 @@ pub struct Entry {
 	// the directory it is, when it is one
 	#[cfg_attr(test, serde(skip))]
 	pub dir: Option<PathBuf>,
+	// what the project file sets on it
+	#[cfg_attr(test, serde(skip))]
+	pub properties: Option<Value>,
+	#[cfg_attr(test, serde(skip))]
+	pub attributes: Option<Value>,
+	// a child that a .model.json describes, which `build` reads from that file
+	#[cfg_attr(test, serde(skip))]
+	pub in_model: bool,
 }
 
 impl Entry {
 	fn new(name: &str, class_name: &str) -> Entry {
-		Entry { name: name.to_string(), class_name: class_name.to_string(), file_paths: Vec::new(), children: Vec::new(), dir: None }
+		Entry {
+			name: name.to_string(),
+			class_name: class_name.to_string(),
+			file_paths: Vec::new(),
+			children: Vec::new(),
+			dir: None,
+			properties: None,
+			attributes: None,
+			in_model: false,
+		}
 	}
 }
 
@@ -44,9 +61,13 @@ enum File {
 }
 
 pub fn read(dir: &Path, project_file: &str) -> Res<Entry> {
-	let project = read_json(&dir.join(project_file))?;
+	read_value(dir, project_file, &read_json(&dir.join(project_file))?)
+}
+
+// The same for a project file's content, as `build` has it with the snapshot added.
+pub fn read_value(dir: &Path, project_file: &str, project: &Value) -> Res<Entry> {
 	let reader = Reader { dir, legacy: project["emitLegacyScripts"].as_bool().unwrap_or(true) };
-	reader.project(Path::new(project_file), &project)
+	reader.project(Path::new(project_file), project)
 }
 
 struct Reader<'a> {
@@ -121,6 +142,8 @@ impl Reader<'_> {
 				entry
 			}
 		};
+		entry.properties = body.get("$properties").cloned();
+		entry.attributes = body.get("$attributes").cloned();
 		for (key, child) in body.as_object().into_iter().flatten() {
 			if key.starts_with('$') || !child.is_object() {
 				continue;
@@ -226,7 +249,9 @@ fn model_json(name: &str, model: &Value) -> Entry {
 	let mut entry = Entry::new(name, field("className", "ClassName").as_str().unwrap_or("Folder"));
 	for child in field("children", "Children").as_array().into_iter().flatten() {
 		let child_name = child.get("name").or_else(|| child.get("Name")).and_then(Value::as_str).unwrap_or_default();
-		entry.children.push(model_json(child_name, child));
+		let mut child = model_json(child_name, child);
+		child.in_model = true;
+		entry.children.push(child);
 	}
 	entry
 }
@@ -291,8 +316,9 @@ mod tests {
 		fs::write(file, text).unwrap();
 	}
 
-	// Every rule the reader knows, against Rojo itself (needs `rojo` on PATH).
+	// Every rule the reader knows, against Rojo itself.
 	#[test]
+	#[ignore = "needs rojo"]
 	fn matches_rojo() {
 		let dir = std::env::temp_dir().join(format!("studio-sync-layout-{}", std::process::id()));
 		let _ = fs::remove_dir_all(&dir);
@@ -370,12 +396,12 @@ mod tests {
 
 	// The same check on every registered project of this machine: `cargo test -- --ignored`.
 	#[test]
-	#[ignore]
+	#[ignore = "needs rojo"]
 	fn matches_rojo_on_registered_projects() {
 		let registry = crate::registry::Registry::read().unwrap();
 		let mut failed = Vec::new();
 		for dir in registry.projects.iter().filter(|d| d.exists()) {
-			let config = crate::config::Config::load(dir).unwrap();
+			let Ok(config) = crate::config::Config::load(dir) else { continue };
 			let found = compare(dir, &config.project);
 			if !found.is_empty() {
 				failed.push(format!("{}:\n  {}", dir.display(), found.join("\n  ")));

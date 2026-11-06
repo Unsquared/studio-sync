@@ -8,15 +8,17 @@ use crate::config::Config;
 use crate::paths::{backup_root, copies_dir, home, local_app_data};
 use crate::registry::{Registry, Session};
 use crate::snapshot::{BuildOptions, build, run};
-use crate::util::{Error, Res, copy, iso_now, mkdirs, random_hex, remove, stamp};
+use crate::util::{Error, Res, copy, iso_now, mkdirs, now_ms, random_hex, remove, stamp};
 use serde_json::Value;
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+const OPEN_LIMIT: Duration = Duration::from_secs(180);
+const COPY_GRACE_MS: u64 = 5 * 60 * 1000;
 
 // In the background: Studio doesn't take focus from whatever the user is doing.
 fn launch(target: &str, is_file: bool) -> Res<()> {
@@ -121,7 +123,7 @@ fn universe_of(place_id: u64) -> Res<u64> {
 	body["universeId"].as_u64().ok_or_else(|| Error(format!("place {place_id} has no universe (is it published?)")))
 }
 
-pub fn open_place(dir: &Path, place_id: u64, timeout: Duration) -> Res<Vec<String>> {
+pub fn open_place(dir: &Path, place_id: u64, moved: bool) -> Res<Vec<String>> {
 	let is_place = |c: &Value| c["placeId"] == place_id && c["session"].is_null();
 	let status = client::status()?;
 	let open = status["projects"]
@@ -133,9 +135,13 @@ pub fn open_place(dir: &Path, place_id: u64, timeout: Duration) -> Res<Vec<Strin
 	if open {
 		return Ok(vec![format!("place {place_id} is already open and connected")]);
 	}
+	if moved {
+		let state = wait_connected(dir, is_place, OPEN_LIMIT)?;
+		return Ok(vec![format!("the Studio on place {place_id} now syncs here: {state}")]);
+	}
 	let universe_id = universe_of(place_id)?;
 	launch(&format!("roblox-studio:1+launchmode:edit+task:EditPlace+placeId:{place_id}+universeId:{universe_id}"), false)?;
-	let state = wait_connected(dir, is_place, timeout)?;
+	let state = wait_connected(dir, is_place, OPEN_LIMIT)?;
 	Ok(vec![format!("opened place {place_id}: {state}")])
 }
 
@@ -157,60 +163,28 @@ fn build_with_command(dir: &Path, copy: &crate::config::Copy, file: &Path) -> Re
 	Ok(vec![format!("built {} with {shown}", copy.output)])
 }
 
-pub fn open_copy(dir: &Path, config: &Config, code_only: bool, timeout: Duration) -> Res<Vec<String>> {
+pub fn open_copy(dir: &Path, config: &Config, code_only: bool) -> Res<Vec<String>> {
+	let cleaned = clean_closed()?;
 	let session = random_hex(4);
 	mkdirs(&copies_dir())?;
 	let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
 	let file = copies_dir().join(format!("{name}-copy-{session}.rbxl"));
-	let mut lines = match (&config.copy, code_only) {
+	let built_at = now_ms();
+	let mut lines = cleaned;
+	lines.extend(match (&config.copy, code_only) {
 		(Some(copy), false) => build_with_command(dir, copy, &file)?,
 		_ => build(dir, config, &BuildOptions { output: file.clone(), snapshot: !code_only })?,
-	};
+	});
 	let mut registry = Registry::read()?;
 	registry.add(dir);
-	registry.sessions.insert(session.clone(), Session { dir: dir.to_path_buf(), file: file.clone(), created_at: iso_now() });
+	registry.sessions.insert(session.clone(), Session { dir: dir.to_path_buf(), file: file.clone(), created_at: iso_now(), built_at });
 	registry.write()?;
 	launch(&file.to_string_lossy(), true)?;
-	let state = wait_connected(dir, |c| c["session"] == session.as_str(), timeout)?;
+	let state = wait_connected(dir, |c| c["session"] == session.as_str(), OPEN_LIMIT)?;
 	let file_name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
 	lines.push(format!("opened copy {session} ({file_name}): {state}"));
 	lines.push("Studio edits in this copy sync to this checkout only".into());
 	Ok(lines)
-}
-
-// Copies whose Studio is gone are deleted with `clean`.
-pub fn copies(clean: bool) -> Res<Vec<String>> {
-	let mut registry = Registry::read()?;
-	let live: HashSet<String> = client::status()
-		.map(|status| {
-			status["projects"]
-				.as_array()
-				.into_iter()
-				.flatten()
-				.flat_map(|p| p["clients"].as_array().cloned().unwrap_or_default())
-				.filter_map(|c| c["session"].as_str().map(str::to_string))
-				.collect()
-		})
-		.unwrap_or_default();
-	let mut lines = Vec::new();
-	let mut closed = Vec::new();
-	for (id, session) in &registry.sessions {
-		let open = live.contains(id);
-		if clean && !open {
-			remove(&session.file)?;
-			closed.push(id.clone());
-			lines.push(format!("removed {id} ({})", session.file.file_name().unwrap_or_default().to_string_lossy()));
-		} else {
-			lines.push(format!("{id}  {}  {}  {}", if open { "open" } else { "closed" }, session.dir.display(), session.created_at));
-		}
-	}
-	if clean {
-		for id in closed {
-			registry.sessions.remove(&id);
-		}
-		registry.write()?;
-	}
-	Ok(if lines.is_empty() { vec!["no copies".into()] } else { lines })
 }
 
 // Studio processes with `file` on their command line.
@@ -223,6 +197,53 @@ fn studios_with(system: &System, file: &Path) -> Vec<sysinfo::Pid> {
 		.filter(|(_, p)| p.cmd().iter().any(|arg| arg == file || arg.to_string_lossy().contains(&*file.to_string_lossy())))
 		.map(|(pid, _)| *pid)
 		.collect()
+}
+
+// A copy that someone closed by hand, not with `close`: its file goes to backups, in case it was saved
+// in Studio. Not one this young: its Studio may still be starting.
+fn clean_closed() -> Res<Vec<String>> {
+	let mut registry = Registry::read()?;
+	let mut system = System::new().map_err(|e| Error(format!("list processes: {e}")))?;
+	system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always));
+	let now = now_ms();
+	// connected counts too, in case a Studio's command line does not name its file
+	let status = client::status().unwrap_or_default();
+	let connected = |id: &str| {
+		status["projects"]
+			.as_array()
+			.into_iter()
+			.flatten()
+			.any(|p| p["clients"].as_array().into_iter().flatten().any(|c| c["session"].as_str() == Some(id)))
+	};
+	let closed: Vec<String> = registry
+		.sessions
+		.iter()
+		.filter(|(id, s)| now.saturating_sub(s.built_at) > COPY_GRACE_MS && !connected(id) && studios_with(&system, &s.file).is_empty())
+		.map(|(id, _)| id.clone())
+		.collect();
+	let mut moved = Vec::new();
+	for id in closed {
+		let Some(session) = registry.sessions.get(&id) else { continue };
+		let name = session.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+		// a file that won't move stays, with its session, for the next look
+		let target = backup_root().join(&name).join(format!("{}-copy", stamp()));
+		let kept = !session.file.exists()
+			|| mkdirs(&target).and_then(|_| copy(&session.file, &target.join(session.file.file_name().unwrap_or_default()))).is_ok();
+		if !kept || remove(&session.file).is_err() {
+			continue;
+		}
+		let mut lock = session.file.clone().into_os_string();
+		lock.push(".lock");
+		let _ = remove(Path::new(&lock));
+		move_recovery_files(&session.file, &name)?;
+		moved.push(id.clone());
+		registry.sessions.remove(&id);
+	}
+	if moved.is_empty() {
+		return Ok(Vec::new());
+	}
+	registry.write()?;
+	Ok(vec![format!("moved {} closed copies to backups: {}", moved.len(), moved.join(", "))])
 }
 
 // Closes copies (no save: code is already on disk; snapshot first to keep anything else),
@@ -239,10 +260,12 @@ pub fn close_copies(dir: &Path, which: Option<&str>) -> Res<Vec<String>> {
 		.map(|(id, _)| id.clone())
 		.collect();
 	if ids.is_empty() {
-		return Ok(vec![match which {
+		let mut lines = vec![match which {
 			Some(which) => format!("no copy {which}"),
-			None => "no copies of this checkout".into(),
-		}]);
+			None => "no copies of this checkout".to_string(),
+		}];
+		lines.extend(clean_closed()?);
+		return Ok(lines);
 	}
 	let mut system = System::new().map_err(|e| Error(format!("list processes: {e}")))?;
 	system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always));
@@ -270,6 +293,7 @@ pub fn close_copies(dir: &Path, which: Option<&str>) -> Res<Vec<String>> {
 		lines.push(format!("closed {id}{}, deleted {file_name}", if pids.is_empty() { " (no Studio had it open)" } else { "" }));
 	}
 	registry.write()?;
+	lines.extend(clean_closed()?);
 	Ok(lines)
 }
 

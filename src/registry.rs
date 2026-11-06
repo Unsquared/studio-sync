@@ -1,6 +1,7 @@
 // projects.json: the registered projects, the place ids a checkout claimed, and
 // the open copies. The CLI writes it; the daemon watches it.
 
+use crate::config::CONFIG_FILE;
 use crate::paths::{STATE_DIR, projects_file};
 use crate::util::{Error, Res, mkdirs, read, rename, write};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,9 @@ pub struct Session {
 	pub file: PathBuf,
 	#[serde(rename = "createdAt")]
 	pub created_at: String,
+	// When its build started, in ms: a model file not changed since is what the copy holds.
+	#[serde(rename = "builtAt", default)]
+	pub built_at: u64,
 }
 
 impl Registry {
@@ -43,10 +47,10 @@ impl Registry {
 		}
 	}
 
-	// Drops projects whose directory is gone, then replaces the file in one rename,
+	// Drops projects whose directory or config is gone, then replaces the file in one rename,
 	// so the daemon never reads half a file.
 	pub fn write(mut self) -> Res<()> {
-		self.projects.retain(|dir| dir.is_dir());
+		self.projects.retain(|dir| dir.join(CONFIG_FILE).is_file());
 		self.claims.retain(|_, dir| dir.is_dir());
 		mkdirs(&STATE_DIR)?;
 		let file = projects_file();
